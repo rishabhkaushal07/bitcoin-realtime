@@ -1,0 +1,57 @@
+[project]
+name = "bitcoin-realtime"
+version = "0.1.0"
+description = "Real-time Bitcoin blockchain analytics pipeline — ZMQ + RPC → Kafka → Iceberg → StarRocks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    # Core pipeline
+    "pyzmq>=27.1.0",
+    "confluent-kafka>=2.13.0",
+    "requests>=2.33.0",
+    # Iceberg (PyIceberg sidecar for finality/reorg upserts)
+    "pyiceberg[s3fs]>=0.11.1",
+    # Spark (historical backfill + table maintenance)
+    "pyspark>=4.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.11.0",
+    "mypy>=1.15.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["live-normalizer", "pyiceberg-sidecar"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "unit: Unit tests (no external deps)",
+    "integration: Integration tests (require Docker services)",
+    "slow: Slow tests (e.g., large block processing)",
+]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

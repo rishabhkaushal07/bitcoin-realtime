@@ -1,0 +1,189 @@
+# =============================================================================
+# Bitcoin Real-Time Pipeline — Docker Compose
+# =============================================================================
+# All persistent data bind-mounted to /local-scratch4/bitcoin_2025/ (SSD)
+# Bitcoin Core runs natively (not in this compose) — see README.md
+#
+# Image versions pinned (updated 2026-03-26):
+#   Kafka 4.0.2 | MinIO 2025-09-07 | MySQL 8.4.8 | Hive 4.2.0
+#   StarRocks 4.0.8
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode — no ZooKeeper needed since Kafka 3.3+)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.0.2
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"    # client connections
+      - "9093:9093"    # controller
+    environment:
+      # KRaft settings
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Listener settings
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topic defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Log retention
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1 GB
+      # Performance
+      KAFKA_NUM_PARTITIONS: 1
+    volumes:
+      - /local-scratch4/bitcoin_2025/kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage for Iceberg warehouse
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    hostname: minio
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # Console UI
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - /local-scratch4/bitcoin_2025/minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # MinIO init — create the warehouse bucket on first start
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing myminio/warehouse;
+      echo 'Bucket warehouse created';
+      "
+
+  # ---------------------------------------------------------------------------
+  # MySQL — backend for Hive Metastore
+  # ---------------------------------------------------------------------------
+  mysql-hms:
+    image: mysql:8.4.8
+    container_name: mysql-hms
+    hostname: mysql-hms
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: metastore_db
+      MYSQL_USER: hive
+      MYSQL_PASSWORD: hive
+    volumes:
+      - /local-scratch4/bitcoin_2025/hms-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: mysqladmin ping -h localhost -u root -padmin
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Hive Metastore — Iceberg catalog
+  # ---------------------------------------------------------------------------
+  hive-metastore:
+    image: apache/hive:4.2.0
+    container_name: hive-metastore
+    hostname: hive-metastore
+    ports:
+      - "9083:9083"    # Thrift
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: mysql
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=com.mysql.cj.jdbc.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:mysql://mysql-hms:3306/metastore_db?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    depends_on:
+      mysql-hms:
+        condition: service_healthy
+    healthcheck:
+      test: bash -c "cat < /dev/tcp/localhost/9083"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # StarRocks FE — query planning and metadata
+  # ---------------------------------------------------------------------------
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:4.0.8
+    container_name: starrocks-fe
+    hostname: starrocks-fe
+    ports:
+      - "8030:8030"    # HTTP
+      - "9020:9020"    # RPC
+      - "9030:9030"    # MySQL protocol
+    volumes:
+      - /local-scratch4/bitcoin_2025/starrocks-fe-meta:/opt/starrocks/fe/meta
+    healthcheck:
+      test: curl -f http://localhost:8030/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # StarRocks BE — storage and compute
+  # ---------------------------------------------------------------------------
+  starrocks-be:
+    image: starrocks/be-ubuntu:4.0.8
+    container_name: starrocks-be
+    hostname: starrocks-be
+    ports:
+      - "8040:8040"    # HTTP
+      - "9060:9060"    # Thrift
+    environment:
+      - STARROCKS_FE_HOST=starrocks-fe
+    volumes:
+      - /local-scratch4/bitcoin_2025/starrocks-data:/opt/starrocks/be/storage
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+    healthcheck:
+      test: curl -f http://localhost:8040/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  default:
+    name: bitcoin-realtime

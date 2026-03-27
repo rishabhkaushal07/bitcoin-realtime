@@ -51,7 +51,7 @@ Implementation plan: `/local-scratch4/bitcoin_2025/bitcoin-realtime/plan.md`
 ### Docker
 - All images pinned to specific versions (no `:latest`)
 - All data bind-mounted to `/local-scratch4/bitcoin_2025/`
-- Current versions: Kafka 4.0.2, MinIO 2025-09-07, MySQL 8.4.8, Hive 4.2.0, StarRocks 4.0.8
+- Current versions: Kafka 4.0.2, MinIO 2025-09-07, MySQL 8.4.8, Hive 3.1.3, StarRocks 4.0.8
 
 ### Testing
 - Run unit tests: `source .venv/bin/activate && pytest tests/unit/`

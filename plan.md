@@ -19,9 +19,9 @@
 |                                   |                      |              |
 |                                   v                      v              |
 |                    +--------------------+  +---------------------+      |
-|                    | Kafka Connect      |  | PyIceberg Sidecar   |      |
-|                    | Iceberg Sink       |  | (finality/reorg)    |      |
-|                    | (append path)      |  | (upsert path)       |      |
+|                    | PyIceberg Writer   |  | PyIceberg Finality  |      |
+|                    | (Kafka consumer)   |  | Updater (upsert)    |      |
+|                    | (append path)      |  | (CONFIRMED/REORGED) |      |
 |                    +---------+----------+  +----------+----------+      |
 |                              |                        |                 |
 |                              +------------+-----------+                 |
@@ -65,9 +65,9 @@
 | Event backbone | Apache Kafka | 4.0.2 | Replay, buffering, fan-out |
 | Object storage | MinIO | 2025-09-07 | S3-compatible, Iceberg warehouse |
 | Table format | Apache Iceberg | v2 | Raw source of truth |
-| Catalog | Hive Metastore | 4.2.0 | Iceberg catalog backend |
+| Catalog | Hive Metastore | 3.1.3 | Iceberg catalog backend |
 | Catalog DB | MySQL | 8.4.8 | HMS metadata storage |
-| Lake writer (append) | Kafka Connect | Iceberg Sink | Exactly-once appends |
+| Lake writer (append) | PyIceberg | 0.11.1 | Kafka consumer → Iceberg append |
 | Lake writer (upsert) | PyIceberg | 0.11.1 | Finality/reorg updates |
 | Serving layer | StarRocks | 4.0.8 | OLAP queries, flat table |
 | Historical parser | rusty-blockparser | latest | CSV backfill + oracle |
@@ -90,12 +90,12 @@
 | Docker Compose scaffolded | Done | 6 services, all on SSD |
 | UV + pyproject.toml | Done | All deps installed |
 | .gitignore | Done | Python, Rust, Kafka, Docker |
-| Test framework | Done | 71 unit tests, all passing |
+| Test framework | Done | 133 unit tests, all passing |
 | Subfolder READMEs | Done | ASCII art + tables |
 
 ---
 
-### Phase 1a — Event Backbone [IN PROGRESS]
+### Phase 1a — Event Backbone [COMPLETE]
 
 ```
 Bitcoin Core ZMQ --> Live Normalizer --> Kafka (4 topics)
@@ -105,39 +105,40 @@ Bitcoin Core ZMQ --> Live Normalizer --> Kafka (4 topics)
 |------|--------|-------|
 | Python normalizer modules | Done | 6 modules, tested |
 | Kafka topic creation script | Done | 4 data + 1 control |
-| `docker compose up -d` | TODO | Start Kafka + all services |
-| Run topic creation script | TODO | After Kafka healthy |
-| End-to-end test: normalizer -> Kafka | TODO | Verify messages in topics |
-| Catchup mode test | TODO | Replay blocks 0-N |
-
-**Next immediate steps:**
-1. `docker compose up -d` — bring up all containers
-2. `bash scripts/create-kafka-topics.sh` — create topics
-3. Test normalizer `--test-block 0` against live RPC
-4. Test normalizer with Kafka: produce to topics, consume to verify
+| `docker compose up -d` | Done | All 6 services started |
+| Run topic creation script | Done | 5 topics created |
+| End-to-end test: normalizer -> Kafka | Done | 15 integration tests |
+| Catchup mode test | Done | 5 integration tests |
+| Docker fixes | Done | Dual Kafka listeners, custom subnet, StarRocks CMD, MySQL port |
 
 ---
 
-### Phase 1b — Raw Lake [NOT STARTED]
+### Phase 1b — Raw Lake [COMPLETE]
 
 ```
-Kafka --> Kafka Connect Iceberg Sink --> Iceberg on MinIO
-          PyIceberg Sidecar         --> Iceberg on MinIO (upserts)
+Kafka --> PyIceberg Writer --> Iceberg on MinIO (appends)
+          PyIceberg Finality Updater --> Iceberg on MinIO (upserts)
 ```
+
+Note: Kafka Connect Iceberg Sink was replaced with PyIceberg writer (V3 plan
+"valid fallback" path) because the runtime ZIP is not available as pre-built
+download and must be compiled from source. PyIceberg provides native upsert
+with identifier fields for idempotent writes.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| MinIO + HMS healthy | TODO | Part of compose up |
-| Iceberg tables created via Spark SQL | TODO | `create_raw_tables.sql` |
-| Kafka Connect Docker image | TODO | Custom with Iceberg JARs |
-| 4 Iceberg sink connectors | TODO | One per topic |
-| PyIceberg sidecar | TODO | Finality + reorg upserts |
-| Commit interval tuning | TODO | Target: 60s |
-| End-to-end: Kafka -> Iceberg verify | TODO | Check Parquet files in MinIO |
+| MinIO + HMS healthy | Done | HMS downgraded 4.2.0 → 3.1.3 (Thrift compat) |
+| Iceberg tables created via PyIceberg | Done | 4 tables with identifier fields |
+| HMS JAR compatibility | Done | hadoop-aws-3.1.0 + aws-sdk-1.11.271 |
+| PyIceberg Kafka → Iceberg writer | Done | Batched consumer, configurable flush |
+| PyIceberg finality updater | Done | OBSERVED→CONFIRMED, reorg soft-delete |
+| Iceberg table integration tests | Done | 22 tests (schema, write/read, idempotent) |
+| Kafka → Iceberg integration tests | Done | 12 tests (flush, data integrity, finality) |
+| Unit tests (writer + updater) | Done | 28 tests |
 
 ---
 
-### Phase 1c — Serving Bridge [NOT STARTED]
+### Phase 1c — Serving Bridge [COMPLETE]
 
 ```
 Iceberg on MinIO --> StarRocks External Catalog --> Flat Table
@@ -145,12 +146,13 @@ Iceberg on MinIO --> StarRocks External Catalog --> Flat Table
 
 | Task | Status | Notes |
 |------|--------|-------|
-| StarRocks external catalog | TODO | `iceberg_catalog_v3.sql` |
-| Metadata refresh strategy | TODO | Explicit REFRESH or TTL |
-| Data cache enabled | TODO | On BE local disks |
-| Flat serving table | TODO | `flat_serving_v3.sql` |
-| Per-block incremental insert | TODO | After each Iceberg commit |
-| Query validation | TODO | Compare against raw layer |
+| StarRocks external catalog SQL | Done | `iceberg_catalog_v3.sql` |
+| Metadata refresh strategy | Done | Explicit REFRESH + TTL option documented |
+| Data cache enabled | Done | In catalog properties |
+| Flat serving table SQL | Done | `flat_serving_v3.sql`, PRIMARY KEY(txid) |
+| Flat table builder script | Done | `flat_table_builder.py` (single/range/incremental) |
+| StarRocks integration tests | Done | 11 tests (catalog, flat table, builder) |
+| Unit tests (builder) | Done | 21 tests (SQL structure, range, incremental) |
 
 ---
 
@@ -217,9 +219,9 @@ Live normalizer catches up from last historical ------+
 
 | Test Suite | Count | Scope | Command |
 |-----------|------:|-------|---------|
-| Unit tests | 71 | No external deps | `pytest tests/unit/` |
-| Integration tests | ~15 | Docker + Bitcoin Core | `pytest tests/integration/ -m integration` |
-| DDL validation | 13 | File consistency | `pytest tests/unit/test_ddl_validation.py` |
+| Unit tests | 133 | No external deps | `pytest tests/unit/` |
+| Integration tests | ~60 | Docker + Bitcoin Core | `pytest tests/integration/ -m integration` |
+| DDL validation | 17 | File consistency | `pytest tests/unit/test_ddl_validation.py` |
 
 ---
 

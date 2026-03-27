@@ -3,29 +3,48 @@
 Apache Iceberg table definitions for the raw source-of-truth layer, stored on MinIO (S3-compatible).
 
 ```
-+---------------------+     +---------------------+
-| Kafka Connect       |     | PyIceberg Sidecar   |
-| Iceberg Sink        |     | (finality/reorg)    |
-| (append path)       |     | (upsert path)       |
-+----------+----------+     +----------+----------+
-           |                           |
-           +-------------+-------------+
-                         |
-                         v
-              +---------------------+
-              |  Iceberg on MinIO   |
-              |  s3://warehouse/    |
-              |  btc.db/            |
-              +---------------------+
-              |                     |
-    +---------+---------+  +--------+---------+
-    | blocks            |  | transactions     |
-    | (block_hash PK)   |  | (txid PK)        |
-    +---------+---------+  +--------+---------+
-    | tx_in             |  | tx_out           |
-    | (txid+prev PK)    |  | (txid+idx PK)    |
-    +-------------------+  +------------------+
++===================================================================+
+|                    Iceberg on MinIO                                |
+|                    s3://warehouse/btc.db/                         |
++===================================================================+
+|                                                                   |
+|  Write Paths:                                                     |
+|                                                                   |
+|  +--------------------+       +-----------------------------+     |
+|  | PyIceberg Writer   |       | PyIceberg Finality Updater  |     |
+|  | (Kafka consumer)   |       | (event consumer)            |     |
+|  | APPEND new data    |       | UPSERT finality_status      |     |
+|  +--------+-----------+       +-------------+---------------+     |
+|           |                                 |                     |
+|           +----------------+----------------+                     |
+|                            |                                      |
+|                            v                                      |
+|  +-----------------------------------------------------+         |
+|  |                                                     |         |
+|  |  +-------------------+    +---------------------+   |         |
+|  |  | btc.blocks        |    | btc.transactions    |   |         |
+|  |  | PK: block_hash    |    | PK: txid            |   |         |
+|  |  | Part: bucket(10,  |    | Part: bucket(10,    |   |         |
+|  |  |   height)         |    |   block_height)     |   |         |
+|  |  +-------------------+    +---------------------+   |         |
+|  |                                                     |         |
+|  |  +-------------------+    +---------------------+   |         |
+|  |  | btc.tx_in         |    | btc.tx_out          |   |         |
+|  |  | PK: txid +        |    | PK: txid +          |   |         |
+|  |  |   hashPrevOut +   |    |   indexOut           |   |         |
+|  |  |   indexPrevOut    |    | Part: bucket(10,     |   |         |
+|  |  | Part: bucket(10,  |    |   height)            |   |         |
+|  |  |   block_height)   |    +---------------------+   |         |
+|  |  +-------------------+                               |         |
+|  +-----------------------------------------------------+         |
++===================================================================+
 ```
+
+---
+
+## Status: COMPLETE (Phase 1b)
+
+Tables are created via PyIceberg (not Spark SQL), using `scripts/create_iceberg_tables.py`.
 
 ---
 
@@ -52,24 +71,46 @@ Apache Iceberg table definitions for the raw source-of-truth layer, stored on Mi
 
 ## Write Paths
 
-```
-                    Append Path                    Upsert Path
-                    (new blocks)                   (status updates)
-                         |                              |
-                         v                              v
-              Kafka Connect Iceberg Sink     PyIceberg overwrite_with_filter
-              (exactly-once semantics)       (OBSERVED -> CONFIRMED / REORGED)
-                         |                              |
-                         +---------- Iceberg -----------+
-                                   on MinIO
-```
-
 | Path | Writer | Semantics | Use Case |
 |------|--------|-----------|----------|
-| Append | Kafka Connect Iceberg Sink | Exactly-once append | New block data from Kafka |
-| Upsert | PyIceberg sidecar | Row-level update via identifier fields | Finality promotion, reorg soft-delete |
-| Backfill | Spark batch | Bulk overwrite by partition | Historical CSV load |
-| Maintenance | Spark scheduled | Compaction, snapshot expiry, orphan cleanup | Ongoing table health |
+| Append | PyIceberg writer (Kafka consumer) | Batched append | New block data from Kafka |
+| Upsert | PyIceberg finality updater | Row-level overwrite via identifier fields | Finality promotion, reorg soft-delete |
+| Backfill | Spark batch (Phase 2) | Bulk overwrite by partition | Historical CSV load |
+| Maintenance | Spark scheduled (Phase 3) | Compaction, snapshot expiry, orphan cleanup | Ongoing table health |
+
+**Note:** Original plan used Kafka Connect Iceberg Sink for appends. Replaced with
+PyIceberg writer because the Kafka Connect runtime ZIP is not available as a
+pre-built download.
+
+---
+
+## How to Create Tables
+
+```bash
+# Via PyIceberg script (recommended)
+source .venv/bin/activate
+python scripts/create_iceberg_tables.py
+
+# Requires:
+#   - HMS running and healthy (port 9083)
+#   - MinIO running and healthy (port 9000)
+#   - warehouse bucket exists in MinIO
+```
+
+---
+
+## HMS JAR Compatibility
+
+Hive Metastore 3.1.3 bundles Hadoop 3.1.0. The S3/MinIO JARs must match:
+
+| JAR | Version | Why |
+|-----|---------|-----|
+| `hadoop-aws-3.1.0.jar` | 3.1.0 | Must match Hive's bundled Hadoop version |
+| `aws-java-sdk-bundle-1.11.271.jar` | 1.11.271 | Must match hadoop-aws-3.1.0's AWS SDK dependency |
+| `mysql-connector-j-8.4.0.jar` | 8.4.0 | MySQL 8.4 JDBC driver for HMS schema storage |
+
+**Do NOT use hadoop-aws-3.4.1 or aws-java-sdk-bundle-1.12.x** -- they require Hadoop
+3.3+ classes (`IOStatisticsSource`) that Hive 3.1.3 does not have.
 
 ---
 
@@ -77,18 +118,15 @@ Apache Iceberg table definitions for the raw source-of-truth layer, stored on Mi
 
 | File | Purpose |
 |------|---------|
-| `create_raw_tables.sql` | Spark SQL DDL for all 4 tables + identifier field setup |
+| `create_raw_tables.sql` | Spark SQL DDL for all 4 tables (reference; use PyIceberg script instead) |
 
 ---
 
-## How to Create Tables
+## Tests
 
-```bash
-# Via PySpark connected to HMS
-pyspark --conf spark.sql.catalog.btc=org.apache.iceberg.spark.SparkCatalog \
-        --conf spark.sql.catalog.btc.type=hive \
-        --conf spark.sql.catalog.btc.uri=thrift://hive-metastore:9083
+| Suite | File | Tests |
+|-------|------|------:|
+| Integration | `tests/integration/test_iceberg_tables.py` | 22 |
 
-# Then run:
-# spark.sql(open("iceberg/create_raw_tables.sql").read())
-```
+Covers: HMS connectivity, schema validation, partition specs, table properties,
+write/read roundtrip, idempotent creation.

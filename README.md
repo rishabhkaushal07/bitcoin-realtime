@@ -29,14 +29,15 @@ A real-time Bitcoin blockchain analytics platform that ingests blocks within sec
 |  +-------------+  ZMQ   +----------------+  JSON  +------------------+   |
 |  | Bitcoin Core |------->| Live Normalizer|------->| Kafka (KRaft)    |   |
 |  | (full node)  |<-------| (Python)       |        | 4 data topics    |   |
-|  +-------------+  RPC   +----------------+        +--------+---------+   |
+|  +-------------+  RPC   +----------------+        | 1 control topic  |   |
+|                                                    +--------+---------+   |
 |                                                             |            |
 |                                      +----------------------+            |
 |                                      |                      |            |
 |                                      v                      v            |
 |                       +--------------------+  +---------------------+    |
-|                       | Kafka Connect      |  | PyIceberg Sidecar   |    |
-|                       | Iceberg Sink       |  | (finality/reorg)    |    |
+|                       | PyIceberg Writer   |  | PyIceberg Finality  |    |
+|                       | (Kafka consumer)   |  | Updater             |    |
 |                       | (append: new data) |  | (upsert: status)    |    |
 |                       +---------+----------+  +----------+----------+    |
 |                                 |                        |               |
@@ -69,6 +70,11 @@ A real-time Bitcoin blockchain analytics platform that ingests blocks within sec
 +==========================================================================+
 ```
 
+**Key change from original plan:** Kafka Connect Iceberg Sink was replaced with a
+PyIceberg-based writer because the runtime ZIP is not available as a pre-built
+download. PyIceberg provides native upsert with identifier fields for idempotent
+writes and was the "valid fallback" path from the V3 architecture document.
+
 ---
 
 ## Quick Start
@@ -81,18 +87,21 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 
 # 2. Start infrastructure
-docker compose up -d
+sudo docker compose up -d
 
 # 3. Create Kafka topics
 bash scripts/create-kafka-topics.sh
 
-# 4. Test normalizer (no Kafka needed)
+# 4. Create Iceberg tables (requires HMS healthy)
+python scripts/create_iceberg_tables.py
+
+# 5. Test normalizer (no Kafka needed)
 python live-normalizer/main.py --test-block 0
 
-# 5. Run unit tests
+# 6. Run unit tests (133 tests, no external deps)
 pytest tests/unit/
 
-# 6. Run integration tests (requires Docker services)
+# 7. Run integration tests (requires Docker services)
 pytest tests/integration/ -m integration
 ```
 
@@ -110,52 +119,71 @@ bitcoin-realtime/
 +-- docker-compose.yml            # All infrastructure services
 +-- .gitignore                    # Python, Rust, Kafka, Docker, etc.
 |
-+-- live-normalizer/              # Python: ZMQ + RPC + Kafka producer
++-- live-normalizer/              # Phase 1a: ZMQ + RPC + Kafka producer
 |   +-- main.py                   # Entry point (--test-block, --catchup, live)
 |   +-- zmq_listener.py           # ZMQ hashblock subscriber
 |   +-- rpc_client.py             # Bitcoin Core JSON-RPC client
 |   +-- normalizer.py             # Block JSON -> 4 record types
 |   +-- kafka_producer.py         # Publish to 4 Kafka topics
 |   +-- checkpoint_store.py       # File-based restart recovery
-|   +-- README.md                 # Module docs with data flow diagrams
+|   +-- README.md
 |
-+-- kafka-connect/                # Kafka Connect Iceberg Sink config
-|   +-- README.md                 # Architecture + planned files
-|
-+-- pyiceberg-sidecar/            # Finality/reorg upserts via PyIceberg
-|   +-- README.md                 # Architecture + planned files
++-- pyiceberg-sidecar/            # Phase 1b: Kafka -> Iceberg + finality
+|   +-- iceberg_writer.py         # Batched Kafka consumer -> Iceberg append
+|   +-- finality_updater.py       # OBSERVED->CONFIRMED, reorg soft-delete
+|   +-- README.md
 |
 +-- iceberg/                      # Iceberg raw table DDL
 |   +-- create_raw_tables.sql     # 4 tables with partitioning + identifiers
-|   +-- README.md                 # Table schemas + write paths
+|   +-- README.md
 |
-+-- starrocks/                    # StarRocks DDL
++-- starrocks/                    # Phase 1c: Serving layer
 |   +-- iceberg_catalog_v3.sql    # External catalog -> HMS -> MinIO
-|   +-- flat_serving_v3.sql       # Native flat table + incremental INSERT
-|   +-- README.md                 # Components + metadata refresh
+|   +-- flat_serving_v3.sql       # Native flat table DDL
+|   +-- flat_table_builder.py     # Incremental flat table builder
+|   +-- README.md
 |
-+-- spark/                        # PySpark: backfill + maintenance
-|   +-- README.md                 # Planned jobs
-|
-+-- validation/                   # Parity checks + monitoring
-|   +-- README.md                 # Planned checks
++-- hive-metastore/               # HMS JAR dependencies
+|   +-- mysql-connector-j-8.4.0.jar
+|   +-- hadoop-aws-3.1.0.jar
+|   +-- aws-java-sdk-bundle-1.11.271.jar
+|   +-- hive-site.xml
 |
 +-- scripts/                      # Operational scripts
 |   +-- create-kafka-topics.sh    # Create 4 data + 1 control topic
-|   +-- README.md                 # Script docs
+|   +-- create_iceberg_tables.py  # PyIceberg table creation script
+|   +-- README.md
+|
++-- kafka-connect/                # DEPRECATED (replaced by PyIceberg writer)
+|   +-- README.md
+|
++-- spark/                        # Phase 2: PySpark backfill + maintenance
+|   +-- README.md
+|
++-- validation/                   # Phase 3: Parity checks + monitoring
+|   +-- README.md
 |
 +-- tests/
     +-- conftest.py               # Shared fixtures (sample RPC blocks)
-    +-- unit/                     # Unit tests (no external deps)
-    |   +-- test_normalizer.py    # 30 tests: genesis, block 170, large, edge
-    |   +-- test_rpc_client.py    # 6 tests: payload, auth, errors
-    |   +-- test_kafka_producer.py # 9 tests: routing, keys, serialization
-    |   +-- test_checkpoint_store.py # 7 tests: persistence, atomicity
-    |   +-- test_zmq_listener.py  # 4 tests: parsing, gap detection
-    |   +-- test_ddl_validation.py # 13 tests: schema consistency
-    +-- integration/              # Integration tests (require Docker)
+    +-- README.md
+    +-- unit/                     # 133 tests (no external deps)
+    |   +-- test_normalizer.py         # 28 tests
+    |   +-- test_rpc_client.py         # 6 tests
+    |   +-- test_kafka_producer.py     # 9 tests
+    |   +-- test_checkpoint_store.py   # 7 tests
+    |   +-- test_zmq_listener.py       # 4 tests
+    |   +-- test_ddl_validation.py     # 17 tests
+    |   +-- test_main.py               # 13 tests
+    |   +-- test_iceberg_writer.py     # 21 tests
+    |   +-- test_finality_updater.py   # 7 tests
+    |   +-- test_flat_table_builder.py # 21 tests
+    +-- integration/              # ~60 tests (require Docker services)
         +-- test_docker_services.py    # Container health checks
         +-- test_normalizer_live.py    # Live RPC normalization
+        +-- test_kafka_e2e.py          # 15 tests: normalizer -> Kafka
+        +-- test_iceberg_tables.py     # 22 tests: schema, write/read
+        +-- test_kafka_to_iceberg.py   # 12 tests: flush, integrity
+        +-- test_starrocks.py          # 11 tests: catalog, flat table
 ```
 
 ---
@@ -163,7 +191,7 @@ bitcoin-realtime/
 ## Data Storage Policy
 
 > **Everything lives under `/local-scratch4/bitcoin_2025/`** (SSD).
-> Docker named volumes are NOT used — all persistent data is bind-mounted.
+> Docker named volumes are NOT used -- all persistent data is bind-mounted.
 
 | Data Store | Path | Expected Size |
 |-----------|------|---------------|
@@ -184,9 +212,57 @@ bitcoin-realtime/
 | MinIO | `minio/minio` | RELEASE.2025-09-07 |
 | MinIO client | `minio/mc` | RELEASE.2025-08-13 |
 | MySQL | `mysql` | 8.4.8 |
-| Hive Metastore | `apache/hive` | 4.2.0 |
+| Hive Metastore | `apache/hive` | 3.1.3 |
 | StarRocks FE | `starrocks/fe-ubuntu` | 4.0.8 |
 | StarRocks BE | `starrocks/be-ubuntu` | 4.0.8 |
+
+---
+
+## Docker Networking
+
+All services run on a custom bridge network `bitcoin-realtime` (subnet 172.28.0.0/16).
+
+### Known Issues and Fixes
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| Container-to-container networking broken | Stale Calico/MicroK8s iptables-legacy rules with DROP-all catch-all for "Unknown interface" | Uninstall MicroK8s: `sudo snap remove microk8s --purge`, flush: `sudo iptables-legacy -F && sudo iptables-legacy -X` |
+| Container-to-container still broken after iptables flush | Zombie bridge interfaces from deleted Docker networks (`br-*`) with conflicting NAT/masquerade rules for same subnet | Remove stale bridges: `sudo ip link delete <br-name>`, restart Docker: `sudo systemctl restart docker` |
+| HMS marked "unhealthy" | Hive 3.1.3 JVM startup takes 2-5 min, exceeds 120s healthcheck start_period | Restart HMS once more after it's fully running; Docker healthcheck resets |
+| StarRocks FE won't start after Docker restart | Stale FE metadata references old container IPs | Clear FE meta: `sudo rm -rf /local-scratch4/bitcoin_2025/starrocks-fe-meta/*` |
+| StarRocks BE "Unmatched cluster id" | BE has old cluster metadata after FE meta wipe | Clear BE storage: `sudo rm -rf /local-scratch4/bitcoin_2025/starrocks-data/*` |
+| StarRocks BE heartbeat error | BE heartbeat port is 9050, not 9060 | Register with correct port: `ALTER SYSTEM ADD BACKEND '<ip>:9050'` |
+| HMS crashes on restart: "Error creating transactional connection factory" | HMS tries to re-init schema on restart; OR MySQL not ready yet | Set `IS_RESUME: "true"` env var (maps to `SKIP_SCHEMA_INIT=true`) |
+| HMS `IOStatisticsSource` ClassNotFoundException | hadoop-aws-3.4.1 requires Hadoop 3.3+, but Hive 3.1.3 bundles Hadoop 3.1.0 | Use hadoop-aws-3.1.0.jar + aws-java-sdk-bundle-1.11.271.jar |
+
+### Startup Procedure (after fresh Docker restart)
+
+```bash
+# 1. Start all services
+sudo docker compose up -d
+
+# 2. Wait for HMS to fully start (2-5 minutes)
+#    Check with: sudo docker logs hive-metastore 2>&1 | grep "Started the new metaserver"
+
+# 3. If StarRocks FE is unhealthy, clear metadata and restart:
+sudo docker stop starrocks-fe starrocks-be
+sudo rm -rf /local-scratch4/bitcoin_2025/starrocks-fe-meta/*
+sudo docker start starrocks-fe
+sleep 30
+
+# 4. Clear BE storage if needed and start:
+sudo rm -rf /local-scratch4/bitcoin_2025/starrocks-data/*
+sudo docker start starrocks-be
+sleep 30
+
+# 5. Register BE with FE:
+BE_IP=$(sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' starrocks-be)
+mysql -h 127.0.0.1 -P 9030 -u root -e "ALTER SYSTEM ADD BACKEND '${BE_IP}:9050'"
+
+# 6. Verify all services:
+sudo docker compose ps
+mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep Alive
+```
 
 ---
 
@@ -195,9 +271,9 @@ bitcoin-realtime/
 | Phase | Name | Status |
 |-------|------|--------|
 | 0 | Prerequisites | COMPLETE |
-| 1a | Event Backbone (normalizer + Kafka) | IN PROGRESS |
-| 1b | Raw Lake (Kafka Connect + PyIceberg -> Iceberg) | NOT STARTED |
-| 1c | Serving Bridge (StarRocks external + flat table) | NOT STARTED |
+| 1a | Event Backbone (normalizer + Kafka) | COMPLETE |
+| 1b | Raw Lake (PyIceberg writer -> Iceberg on MinIO) | COMPLETE |
+| 1c | Serving Bridge (StarRocks external + flat table) | COMPLETE |
 | 2 | Historical Backfill + Cutover | NOT STARTED |
 | 3 | Operational Hardening | NOT STARTED |
 | 4 | Optional Scale-Out | NOT STARTED |
@@ -224,8 +300,8 @@ pytest tests/unit/ --cov=live-normalizer --cov-report=term-missing
 
 | Suite | Tests | External Deps |
 |-------|------:|---------------|
-| Unit | 71 | None |
-| Integration | ~15 | Docker + Bitcoin Core |
+| Unit | 133 | None |
+| Integration | ~60 | Docker + Bitcoin Core |
 
 ---
 

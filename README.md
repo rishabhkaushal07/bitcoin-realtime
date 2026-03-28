@@ -152,7 +152,11 @@ bitcoin-realtime/
 +-- scripts/                      # Operational scripts
 |   +-- create-kafka-topics.sh    # Create 4 data + 1 control topic
 |   +-- create_iceberg_tables.py  # PyIceberg table creation script
+|   +-- benchmark_e2e_latency.py  # End-to-end latency benchmark
 |   +-- README.md
+|
++-- docs/                         # Documentation
+|   +-- latency-benchmark-baseline.md  # Baseline latency measurements
 |
 +-- kafka-connect/                # DEPRECATED (replaced by PyIceberg writer)
 |   +-- README.md
@@ -201,6 +205,24 @@ bitcoin-realtime/
 | StarRocks FE | `starrocks-fe-meta/` | minimal |
 | Kafka | `kafka-data/` | ~50 GB |
 | HMS MySQL | `hms-mysql-data/` | minimal |
+
+---
+
+## Technology Choices and Rationale
+
+| Component | Technology | Why This Over Alternatives |
+|-----------|-----------|---------------------------|
+| **Event trigger** | ZMQ (hashblock) | Push-based, sub-second latency. Polling RPC `getblockcount` wastes CPU and adds seconds of delay. `.dat` file watching is unreliable for live blocks. |
+| **Data decoder** | RPC `getblock(hash,2)` | Returns fully decoded JSON with all transactions. No need to parse raw binary formats. Available out-of-the-box with Bitcoin Core. |
+| **Event backbone** | Apache Kafka (KRaft) | Durable, replayable log. Decouples normalizer from lake writer. KRaft mode eliminates ZooKeeper dependency. Single broker is sufficient for Bitcoin's ~1 block/10min throughput. |
+| **Object storage** | MinIO | S3-compatible, self-hosted. Avoids cloud vendor lock-in. Iceberg and StarRocks both speak S3 natively. |
+| **Table format** | Apache Iceberg v2 | Format v2 required for row-level deletes (reorg handling). Schema evolution, hidden partitioning, time travel. Open standard read by Spark, StarRocks, and PyIceberg. |
+| **Catalog** | Hive Metastore 3.1.3 | Mature, widely supported. PyIceberg, Spark, and StarRocks all integrate natively. 3.1.3 specifically because 4.x broke Thrift compatibility with PyIceberg. |
+| **Lake writer** | PyIceberg 0.11.1 | Native Python, no JVM. Supports identifier-field upserts for finality updates. Replaced Kafka Connect Iceberg Sink (no pre-built runtime ZIP available). V3 plan's documented "valid fallback" path. |
+| **Serving layer** | StarRocks 4.0.8 | Sub-second OLAP queries on billions of rows. External Iceberg catalog reads the lake directly. Native flat table on local SSD for hot queries. |
+| **Batch processing** | PySpark 4.1.1 | Required for historical CSV backfill at scale (5.6B+ rows). Also handles Iceberg table maintenance (compaction, snapshot expiry, orphan cleanup). |
+| **Partitioning** | `bucket(10, height)` | Distributes data evenly across 10 buckets regardless of height skew. Bucket partitioning avoids the problem of too many partitions (one per height = 900K+ partitions) while still enabling partition pruning on height-range queries. |
+| **Package manager** | UV 0.11.2 | 10-100x faster than pip. Deterministic resolution. Single `pyproject.toml` for deps + tool config. |
 
 ---
 
@@ -279,6 +301,30 @@ mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep Alive
 | 4 | Optional Scale-Out | NOT STARTED |
 
 See [plan.md](plan.md) for detailed task breakdowns per phase.
+
+---
+
+## Pipeline Latency (baseline benchmark, 2026-03-27)
+
+Measured end-to-end with historical blocks via RPC during Bitcoin Core IBD.
+Full report: [docs/latency-benchmark-baseline.md](docs/latency-benchmark-baseline.md)
+
+```
+  Block → RPC(426ms) → Normalize(14ms) → Kafka(77ms) → Iceberg(392ms) → StarRocks(25ms)
+          ─────────────────── 909ms total (RPC → Iceberg) ───────────────────
+```
+
+| Stage | Small (1 tx) | Medium (~100 tx) | Large (~2,500 tx) | Bottleneck? |
+|-------|----------:|---------------:|-----------------:|:-----------:|
+| RPC fetch | 5 ms | 138 ms | **426 ms** | At scale |
+| Normalize | 2 ms | 0.5 ms | 14 ms | Never |
+| Kafka produce | 3 ms | 7 ms | 77 ms | No |
+| Iceberg write | **777 ms** | 434 ms | 392 ms | At small scale |
+| StarRocks query (warm) | 25 ms | 25 ms | 25 ms | No |
+| **e2e per block** | **787 ms** | **580 ms** | **909 ms** | |
+| **Throughput** | 5 rec/s | 1,411 rec/s | **14,768 rec/s** | |
+
+Bitcoin produces ~1 block / 10 minutes → pipeline has **~660x headroom**.
 
 ---
 

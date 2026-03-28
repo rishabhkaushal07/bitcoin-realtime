@@ -64,12 +64,24 @@ Real-time Bitcoin block normalizer — listens for new blocks via ZMQ, fetches d
 
 ```
 1. ZMQ delivers block hash (32 bytes)          ~0ms latency
-2. RPC getblock(hash, 2) fetches decoded JSON   ~50-200ms
-3. Normalizer maps JSON to 4 record types       ~1-5ms
-4. Kafka producer publishes to 4 topics         ~10-50ms
+2. RPC getblock(hash, 2) fetches decoded JSON   ~3-426ms (scales with tx count)
+3. Normalizer maps JSON to 4 record types       ~0.04-14ms
+4. Kafka producer publishes to 4 topics         ~2-77ms (with flush)
 5. Checkpoint updated to disk                   ~1ms
-                                          Total: ~60-260ms per block
+                                          Total: ~6-520ms per block
 ```
+
+### Measured Latency (baseline benchmark, 2026-03-27)
+
+| Block size | RPC ms | Normalize ms | Kafka ms | Total ms | Records |
+|-----------|-------:|------------:|--------:|--------:|--------:|
+| 1 tx (early) | 4.8 | 1.8 | 3.1 | 9.7 | 4 |
+| ~100 tx (200K era) | 137.6 | 0.5 | 7.4 | 145.5 | 818 |
+| ~2,500 tx (500K era) | 425.9 | 14.3 | 76.5 | 516.7 | 13,423 |
+
+RPC is the dominant cost — it scales linearly with block size because Bitcoin Core
+must serialize the full decoded JSON. Normalization and Kafka produce are negligible
+relative to RPC.
 
 ---
 

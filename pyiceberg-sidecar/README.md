@@ -161,6 +161,24 @@ pytest tests/integration/test_iceberg_tables.py -m integration -v
 
 ---
 
+## Measured Performance (baseline benchmark, 2026-03-27)
+
+| Metric | Value | Notes |
+|--------|------:|-------|
+| Kafka consume throughput | ~16,000 records/sec | confluent-kafka consumer poll |
+| Iceberg write throughput | ~36,000 records/sec | PyArrow table.append to MinIO |
+| Per-table write (27K records) | ~525 ms | tx_in, largest table |
+| Per-table write (20 records) | ~364 ms | blocks, fixed overhead dominates |
+| Fixed overhead per flush | ~300-400 ms | Parquet file creation + S3 upload + metadata commit |
+
+The per-table write has a fixed ~300-400ms floor for Parquet file creation and S3/MinIO
+round-trip, regardless of record count. This means small batches are proportionally more
+expensive — the writer's batch-size tuning matters more for small blocks.
+
+Full benchmark: [docs/latency-benchmark-baseline.md](../docs/latency-benchmark-baseline.md)
+
+---
+
 ## Roadblocks Encountered and Fixes
 
 | Problem | Root Cause | Fix |

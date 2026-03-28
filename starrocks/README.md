@@ -203,6 +203,31 @@ pytest tests/integration/test_starrocks.py -m integration -v
 
 ---
 
+## Measured Query Latency (baseline benchmark, 2026-03-27)
+
+| Scenario | Latency | Notes |
+|----------|--------:|-------|
+| Cold start (first metadata load) | ~180,000 ms | Full HMS metadata + Iceberg manifest parsing + data cache population |
+| Metadata refresh (4 tables) | ~9,500 ms | One-time cost after new Iceberg commits |
+| Warm-cache COUNT(*) with height filter | **23-29 ms** | Data cached on BE SSD |
+
+**Warm-cache query detail (5 blocks at height 500K, ~67K records):**
+
+| Table | Rows | Query ms |
+|-------|-----:|--------:|
+| `btc.blocks` | 5 | 29 |
+| `btc.transactions` | 12,786 | 23 |
+| `btc.tx_in` | 24,941 | 24 |
+| `btc.tx_out` | 29,385 | 23 |
+
+Once metadata is refreshed and data is cached on BE SSD, external catalog queries are
+sub-100ms. The cold-start penalty is a one-time cost per session. For production, set
+`iceberg_meta_cache_ttl_sec = 30` to keep metadata warm.
+
+Full benchmark: [docs/latency-benchmark-baseline.md](../docs/latency-benchmark-baseline.md)
+
+---
+
 ## Roadblocks Encountered and Fixes
 
 | Problem | Root Cause | Fix |

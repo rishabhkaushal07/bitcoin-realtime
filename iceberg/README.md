@@ -59,13 +59,42 @@ Tables are created via PyIceberg (not Spark SQL), using `scripts/create_iceberg_
 
 ---
 
+## Why Iceberg?
+
+| Feature | Why It Matters For This Pipeline |
+|---------|----------------------------------|
+| **Format v2** | Required for row-level deletes: reorg handling needs to soft-delete or overwrite individual rows when a block is orphaned |
+| **Identifier fields** | Enable upsert semantics via PyIceberg. When the finality updater promotes OBSERVED to CONFIRMED, it overwrites the row matched by identifier fields (e.g., `block_hash` for blocks) instead of appending a duplicate |
+| **Hidden partitioning** | `bucket(10, height)` is transparent to queries. Writers don't need to know the partition scheme; readers get automatic partition pruning on height-range predicates |
+| **Schema evolution** | Columns can be added later (e.g., `fee`, `weight`) without rewriting existing data files |
+| **Time travel** | Snapshot-based versioning lets us debug issues by querying table state at any prior commit |
+| **Open format** | Same Iceberg tables readable by PyIceberg, Spark, StarRocks, and any future engine |
+
+---
+
+## Why `bucket(10, height)`?
+
+One partition per block height would create ~900K+ partitions (one per block), causing
+massive metadata overhead and tiny files. Range partitioning (e.g., 100K-height ranges)
+creates uneven partitions because recent blocks have far more transactions than early ones.
+
+Bucket partitioning with 10 buckets:
+- Distributes data evenly regardless of height skew
+- Creates exactly 10 directories (manageable metadata)
+- Still enables partition pruning: `WHERE height BETWEEN 800000 AND 800100` only scans
+  the bucket(s) containing those heights
+- 10 was chosen as a balance between parallelism and file count; with ~1TB of data,
+  each bucket holds ~100GB — large enough for efficient Parquet file sizes
+
+---
+
 ## Table Properties
 
 | Property | Value | Why |
 |----------|-------|-----|
 | `format-version` | `2` | Required for row-level deletes (reorg handling) |
 | `write.format.default` | `parquet` | Columnar, compressible, industry standard |
-| `write.parquet.compression-codec` | `zstd` | Best ratio-to-speed tradeoff |
+| `write.parquet.compression-codec` | `zstd` | Best ratio-to-speed tradeoff for large string columns (hashes, scripts) |
 
 ---
 
@@ -81,6 +110,41 @@ Tables are created via PyIceberg (not Spark SQL), using `scripts/create_iceberg_
 **Note:** Original plan used Kafka Connect Iceberg Sink for appends. Replaced with
 PyIceberg writer because the Kafka Connect runtime ZIP is not available as a
 pre-built download.
+
+---
+
+## How Identifier Fields Enable Upserts
+
+Iceberg v2 identifier fields act as a logical primary key for merge-on-read. When
+PyIceberg writes a row with `overwrite` mode, it matches existing rows by identifier
+fields and replaces them:
+
+```
+btc.blocks:        identifier = [block_hash]
+btc.transactions:  identifier = [txid]
+btc.tx_in:         identifier = [txid, hashPrevOut, indexPrevOut]
+btc.tx_out:        identifier = [txid, indexOut]
+```
+
+This is how the finality updater promotes `OBSERVED -> CONFIRMED` without duplicating
+rows, and how reorg handling sets `finality_status = REORGED` on orphaned blocks.
+
+The append writer (new block data) does NOT use identifier fields — it uses plain
+append mode for maximum throughput. Identifier-based upserts are only used by the
+finality/reorg path.
+
+---
+
+## Technology Versions
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| PyIceberg | 0.11.1 | Writer + table creation. Supports identifier-field upserts |
+| Iceberg format | v2 | Required for row-level deletes |
+| Parquet | default (via PyIceberg) | Columnar storage format |
+| Zstd compression | default level | ~3:1 ratio on hash-heavy Bitcoin data |
+| Hive Metastore | 3.1.3 | Catalog backend (3.x required for PyIceberg Thrift compat) |
+| MinIO | RELEASE.2025-09-07 | S3-compatible warehouse storage |
 
 ---
 

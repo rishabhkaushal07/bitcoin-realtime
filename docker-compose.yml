@@ -5,7 +5,7 @@
 # Bitcoin Core runs natively (not in this compose) — see README.md
 #
 # Image versions pinned (updated 2026-03-26):
-#   Kafka 4.0.2 | MinIO 2025-09-07 | MySQL 8.4.8 | Hive 4.2.0
+#   Kafka 4.0.2 | MinIO 2025-09-07 | MySQL 8.4.8 | Hive 3.1.3
 #   StarRocks 4.0.8
 # =============================================================================
 
@@ -140,10 +140,10 @@ services:
       mysql-hms:
         condition: service_healthy
     healthcheck:
-      test: bash -c "cat < /dev/tcp/localhost/9083"
-      interval: 15s
+      test: bash -c "timeout 3 cat < /dev/tcp/localhost/9083"
+      interval: 30s
       timeout: 10s
-      retries: 10
+      retries: 20
       start_period: 300s
 
   # ---------------------------------------------------------------------------

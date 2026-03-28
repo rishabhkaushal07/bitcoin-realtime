@@ -87,6 +87,40 @@ pytest tests/unit/ --cov=live-normalizer --cov-report=term-missing
 
 ---
 
+## Shared Fixtures (`conftest.py`)
+
+The root `tests/conftest.py` provides sample Bitcoin Core RPC responses used across
+all normalizer and integration tests:
+
+| Fixture | Description | Use Case |
+|---------|-------------|----------|
+| `genesis_block_rpc()` | Block 0 — coinbase only, no inputs from prior txs | Edge case: no `vin.txid`, only `vin.coinbase` |
+| `block_170_rpc()` | Block 170 — first real (non-coinbase) transaction | Standard case: coinbase + regular tx with `vin.txid` + multi-output |
+| `large_block_rpc()` | Synthetic block at height 200K with 50 txs, 100 inputs, 150 outputs | Scale testing: multiple txs, multi-input/multi-output |
+
+All fixtures return the exact JSON shape that `bitcoin-cli getblock <hash> 2` produces.
+
+---
+
+## Mocking Strategy
+
+Unit tests mock all external dependencies to run without Docker or Bitcoin Core:
+
+| External Dependency | Mock Approach | Example |
+|--------------------|---------------|---------|
+| **Bitcoin Core RPC** | `pytest-mock` patches `rpc_client.call_rpc()` with fixture responses | `test_normalizer.py` uses `genesis_block_rpc` fixture |
+| **Kafka producer** | `pytest-mock` patches `KafkaProducer.send()` and captures calls | `test_kafka_producer.py` verifies topic routing + key assignment |
+| **ZMQ socket** | `pytest-mock` patches `zmq.Context.socket()` | `test_zmq_listener.py` simulates hashblock messages |
+| **PyIceberg catalog** | `pytest-mock` patches `load_catalog()` with mock table objects | `test_iceberg_writer.py` verifies flush/batch logic |
+| **StarRocks MySQL** | `pytest-mock` patches `mysql.connector.connect()` | `test_flat_table_builder.py` verifies SQL generation |
+| **File system** | `tmp_path` fixture (built-in pytest) | `test_checkpoint_store.py` uses temp dirs for checkpoint files |
+| **DDL files** | Read actual SQL/Python files on disk | `test_ddl_validation.py` parses real schemas for consistency |
+
+**Key principle:** Unit tests verify logic correctness (normalization, routing, SQL
+generation), not infrastructure connectivity. Integration tests handle the latter.
+
+---
+
 ## Test Coverage by Phase
 
 ```

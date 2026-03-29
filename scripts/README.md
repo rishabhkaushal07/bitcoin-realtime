@@ -105,6 +105,11 @@ python scripts/create_iceberg_tables.py --drop
 | Warehouse | `s3://warehouse/` |
 | IO implementation | `pyiceberg.io.pyarrow.PyArrowFileIO` |
 
+**Note on integer types (updated 2026-03-28):** Several Bitcoin fields that are unsigned
+32-bit integers use `LongType()` / `BIGINT` instead of `IntegerType()` / `INT` to avoid
+signed INT32 overflow. This affects `nNonce`, `nBits`, `indexPrevOut`, and `lockTime`.
+See the root README "Schema Evolution" section for details.
+
 ---
 
 ### `create_iceberg_tables_spark.py`

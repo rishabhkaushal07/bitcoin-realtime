@@ -46,12 +46,13 @@ StarRocks serving layer -- reads raw Iceberg tables via external catalog and mai
 
 ---
 
-## Status: COMPLETE (Phase 1c)
+## Status: COMPLETE and LIVE (Phase 1c)
 
-All components implemented and tested:
+All components implemented, tested, and serving live data since 2026-03-28:
 - External Iceberg catalog DDL
-- Native flat serving table DDL
+- Native flat serving table DDL (composite PK: `txid, block_height`)
 - Incremental flat table builder (Python)
+- Custom BE configuration (40GB mem_limit, spill-to-disk, tuned timeouts)
 
 ---
 
@@ -61,6 +62,7 @@ All components implemented and tested:
 |-----------|-------|-------|-----------|
 | FE (Frontend) | `starrocks/fe-ubuntu:4.0.8` | 8030, 9020, 9030 | `/local-scratch4/bitcoin_2025/starrocks-fe-meta/` |
 | BE (Backend) | `starrocks/be-ubuntu:4.0.8` | 8040, 9050, 9060 | `/local-scratch4/bitcoin_2025/starrocks-data/` |
+| BE Spill dir | (same container) | — | `/local-scratch4/bitcoin_2025/starrocks-spill/` |
 
 ---
 
@@ -71,6 +73,7 @@ All components implemented and tested:
 | `iceberg_catalog_v3.sql` | External catalog pointing to HMS + MinIO (with data cache) |
 | `flat_serving_v3.sql` | Native flat serving table with ARRAY<STRUCT> columns |
 | `flat_table_builder.py` | Incremental flat table builder (Python, 3 modes) |
+| `be.conf` | Custom BE configuration (40GB mem_limit, spill-to-disk paths) |
 
 ---
 
@@ -96,17 +99,20 @@ PROPERTIES (
 
 ```
 +===================================================================+
-|  bitcoin_v3.bitcoin_flat_v3  (PRIMARY KEY: txid)                  |
+|  bitcoin_v3.bitcoin_flat_v3                                       |
+|  PRIMARY KEY: (txid, block_height)                                |
 +===================================================================+
+|                                                                   |
+|  Key columns (must be first for StarRocks PRIMARY KEY model):     |
+|    txid VARCHAR(64)            <-- part of PK                     |
+|    block_height INT            <-- part of PK + partition column   |
 |                                                                   |
 |  Block columns:                                                   |
 |    block_hash VARCHAR(64)                                         |
-|    block_height INT                                               |
 |    block_timestamp DATETIME                                       |
 |    nTime INT                                                      |
 |                                                                   |
 |  Transaction columns:                                             |
-|    txid VARCHAR(64)  <-- PRIMARY KEY                              |
 |    tx_version INT                                                 |
 |    lockTime INT                                                   |
 |                                                                   |
@@ -115,7 +121,7 @@ PROPERTIES (
 |    inputs ARRAY<STRUCT<                                           |
 |      hashPrevOut VARCHAR(64),                                     |
 |      indexPrevOut INT,                                             |
-|      scriptSig VARCHAR(4096),                                     |
+|      scriptSig STRING,                                            |
 |      sequence BIGINT>>                                            |
 |                                                                   |
 |  Output columns:                                                  |
@@ -124,7 +130,7 @@ PROPERTIES (
 |    outputs ARRAY<STRUCT<                                          |
 |      indexOut INT,                                                 |
 |      value BIGINT,                                                |
-|      scriptPubKey VARCHAR(4096),                                  |
+|      scriptPubKey STRING,                                         |
 |      address VARCHAR(128)>>                                       |
 |                                                                   |
 |  Metadata:                                                        |
@@ -132,7 +138,12 @@ PROPERTIES (
 +===================================================================+
 ```
 
-Partitioned by `block_height` ranges of 100K blocks, distributed by `HASH(txid)`.
+Partitioned by `RANGE(block_height)` in 100K-block chunks (p0 through p900k),
+distributed by `HASH(txid)`.
+
+**Note:** StarRocks PRIMARY KEY model requires key columns to be the first columns in
+the schema, and partition columns must be part of the key. Hence the composite PK
+`(txid, block_height)` with `block_height` as the second key column.
 
 ---
 
@@ -150,6 +161,60 @@ The builder reads from Iceberg via the StarRocks external catalog (4-table JOIN 
 ARRAY_AGG + NAMED_STRUCT) and inserts denormalized rows into the native flat table.
 Incremental mode queries the max height in both flat table and Iceberg, then builds
 only the gap.
+
+---
+
+## BE Configuration and Memory Tuning
+
+The BE runs with a custom `be.conf` mounted from `starrocks/be.conf`. This is critical
+for a shared machine where other services (Bitcoin Core, Kafka, MinIO, Python pipelines)
+compete for RAM.
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| `mem_limit` | `40G` | Fixed limit. Default is 90% of system RAM (~56G on 62G machine), starving other services. 40G leaves headroom for Bitcoin Core (~12G), Kafka, MinIO, and Python processes |
+| `spill_local_storage_dir` | `/opt/starrocks/be/spill` | Bound to SSD at `/local-scratch4/bitcoin_2025/starrocks-spill/`. Overflow destination for large queries |
+| `storage_root_path` | `/opt/starrocks/be/storage` | Bound to SSD at `/local-scratch4/bitcoin_2025/starrocks-data/` |
+
+### Global Session Variables (set once, persist across sessions)
+
+```sql
+SET GLOBAL enable_spill = true;          -- Allow spill-to-disk for memory-heavy queries
+SET GLOBAL spill_mode = 'auto';          -- Spill triggered by memory pressure (not forced)
+SET GLOBAL query_timeout = 3600;         -- 1 hour for complex Iceberg queries
+SET GLOBAL insert_timeout = 7200;        -- 2 hours for large flat table batch inserts
+```
+
+### Docker Compose Volumes
+
+```yaml
+starrocks-be:
+  volumes:
+    - /local-scratch4/bitcoin_2025/starrocks-data:/opt/starrocks/be/storage
+    - /local-scratch4/bitcoin_2025/starrocks-spill:/opt/starrocks/be/spill
+    - ./starrocks/be.conf:/opt/starrocks/be/conf/be.conf:ro
+```
+
+### Verifying BE Configuration
+
+```bash
+# Check mem_limit and spill settings
+curl -s http://localhost:8040/varz | grep -E "^mem_limit|^spill_local_storage"
+
+# Check via SHOW BACKENDS (MemLimit column)
+mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep MemLimit
+
+# Check spill variables
+mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW VARIABLES LIKE '%spill%'"
+```
+
+### Historical Reference
+
+For detailed notes on StarRocks memory management, spill-to-disk debugging, query
+profiling, and heap analysis, see the old repo documentation at
+`dmg-bitcoin/starrocks/README.md`. That repo ran StarRocks 3.1.3 (all-in-one) on
+much larger machines (256GB-1.5TB RAM) and contains extensive notes on tuning for
+full-chain analytics workloads.
 
 ---
 
@@ -228,6 +293,27 @@ Full benchmark: [docs/latency-benchmark-baseline.md](../docs/latency-benchmark-b
 
 ---
 
+## Live Pipeline Integration (2026-03-28)
+
+The flat table builder has been verified against live Iceberg data from the running
+pipeline. Block 942,725 (5,684 transactions) was denormalized in **1.4 seconds**:
+
+```bash
+$ python starrocks/flat_table_builder.py --height 942725
+2026-03-28 19:12:54 [INFO] Building flat table for block 942725
+2026-03-28 19:12:55 [INFO] Inserted 5684 transactions
+2026-03-28 19:12:55 [INFO] Done in 1.4s
+```
+
+For continuous operation, run `--incremental` periodically to catch up with new blocks:
+
+```bash
+# Cron or watch loop:
+python starrocks/flat_table_builder.py --incremental
+```
+
+---
+
 ## Roadblocks Encountered and Fixes
 
 | Problem | Root Cause | Fix |
@@ -236,3 +322,6 @@ Full benchmark: [docs/latency-benchmark-baseline.md](../docs/latency-benchmark-b
 | BE "Unmatched cluster id" | BE has old cluster metadata after FE meta wipe | Clear `/local-scratch4/bitcoin_2025/starrocks-data/*` and restart |
 | BE "Invalid method name: 'heartbeat'" | Heartbeat port is 9050, not 9060 (Thrift) | Register BE with correct port: `ALTER SYSTEM ADD BACKEND '<ip>:9050'` |
 | Missing pymysql | flat_table_builder.py needs pymysql for MySQL protocol | `uv pip install pymysql` |
+| `PRIMARY KEY (txid)` rejected | StarRocks requires PK columns first in schema AND partition column in PK | Changed to composite PK `(txid, block_height)` with txid first, block_height second |
+| BE OOM risk on 62GB shared machine | Default `mem_limit=90%` takes ~56GB, starving other services | Custom `be.conf` with `mem_limit=40G`, spill-to-disk enabled |
+| Large queries timeout | Default `query_timeout=300s` too short for Iceberg joins | `SET GLOBAL query_timeout = 3600` (1 hour) |

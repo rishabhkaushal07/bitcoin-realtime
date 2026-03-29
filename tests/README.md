@@ -28,7 +28,7 @@ Test suite for the Bitcoin real-time pipeline.
 |-------|------|------:|-------|
 | Normalizer | `unit/test_normalizer.py` | 28 | Genesis, block 170, large blocks, edge cases |
 | Main entry | `unit/test_main.py` | 13 | CLI args, mode selection, error handling |
-| DDL Validation | `unit/test_ddl_validation.py` | 17 | Schema consistency across SQL/Python files |
+| DDL Validation | `unit/test_ddl_validation.py` | 17 | Schema consistency across SQL/Python files (validates composite PK, BIGINT types) |
 | Iceberg Writer | `unit/test_iceberg_writer.py` | 21 | Topic mapping, buffering, flush, stop |
 | Flat Table Builder | `unit/test_flat_table_builder.py` | 21 | SQL structure, range, incremental logic |
 | Kafka Producer | `unit/test_kafka_producer.py` | 9 | Routing, keys, serialization |
@@ -118,6 +118,15 @@ Unit tests mock all external dependencies to run without Docker or Bitcoin Core:
 
 **Key principle:** Unit tests verify logic correctness (normalization, routing, SQL
 generation), not infrastructure connectivity. Integration tests handle the latter.
+
+---
+
+## Notable Test Changes (2026-03-28)
+
+| Change | File | Reason |
+|--------|------|--------|
+| PK assertion updated | `test_ddl_validation.py` | Flat table changed from `PRIMARY KEY (txid)` to `PRIMARY KEY (txid, block_height)` — StarRocks requires partition column in PK |
+| Arrow type updated | `test_iceberg_tables.py` | `nBits` and `nNonce` changed from `pa.int32()` to `pa.int64()` to match Iceberg schema evolution |
 
 ---
 

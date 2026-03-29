@@ -49,10 +49,10 @@ Python services that write normalized Bitcoin data from Kafka to Iceberg tables,
 
 ---
 
-## Status: COMPLETE (Phase 1b)
+## Status: COMPLETE and LIVE (Phase 1b)
 
-Both components are implemented and tested:
-- `iceberg_writer.py` — 197 lines, batched Kafka consumer
+Both components are implemented, tested, and running since 2026-03-28:
+- `iceberg_writer.py` — 197 lines, batched Kafka consumer (live, draining blocks)
 - `finality_updater.py` — 176 lines, event-driven upserts
 
 ---
@@ -135,8 +135,26 @@ compiled from source. PyIceberg was the documented "valid fallback" path.
 # Start the Iceberg writer (requires Kafka + HMS + MinIO)
 python pyiceberg-sidecar/iceberg_writer.py
 
+# Start with custom batch size and flush interval
+python pyiceberg-sidecar/iceberg_writer.py --batch-size 500 --flush-interval 10
+
 # Start the finality updater
 python pyiceberg-sidecar/finality_updater.py
+```
+
+### Running as Background Service
+
+```bash
+# Iceberg writer (background, logging to file)
+nohup .venv/bin/python pyiceberg-sidecar/iceberg_writer.py \
+    > logs/iceberg_writer.log 2>&1 &
+
+# Monitor progress
+tail -f logs/iceberg_writer.log
+
+# Check Kafka consumer lag
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:29092 --describe --group iceberg-writer
 ```
 
 ---
@@ -179,12 +197,29 @@ Full benchmark: [docs/latency-benchmark-baseline.md](../docs/latency-benchmark-b
 
 ---
 
+## Schema Evolution (2026-03-28)
+
+Several unsigned 32-bit Bitcoin fields caused `ArrowInvalid: Value too large to fit in
+C integer type` at runtime. Fixed via Iceberg schema evolution (no table recreation):
+
+| Table | Column | Issue | Fix |
+|-------|--------|-------|-----|
+| `btc.blocks` | `nNonce` | Values > 2^31 overflow INT32 | Evolved to LONG |
+| `btc.blocks` | `nBits` | Compact target can exceed INT32 | Evolved to LONG |
+| `btc.tx_in` | `indexPrevOut` | Coinbase uses 0xFFFFFFFF (4,294,967,295) | Evolved to LONG |
+| `btc.transactions` | `lockTime` | Unsigned 32-bit field | Evolved to LONG |
+
+Schema evolution was applied live using PyIceberg's `table.update_schema()` API.
+Existing Parquet files are read with automatic type promotion (INT -> LONG).
+
+---
+
 ## Roadblocks Encountered and Fixes
 
 | Problem | Root Cause | Fix |
 |---------|-----------|-----|
 | PyArrow schema mismatch on write | Default inferred types (int64, optional) don't match Iceberg schema (int32, required) | Use `schema_to_pyarrow(table.schema())` from `pyiceberg.io.pyarrow` |
 | `pa.null()` not supported in Iceberg v2 | Null type arrays rejected by Iceberg format | Use string placeholder `"unknown"` instead of `None` for nullable fields |
-| `indexPrevOut` int32 overflow | Value 4294967295 (0xFFFFFFFF for coinbase) exceeds int32 max | Already handled as `UINT32_MAX` in normalizer; use 0 in test data |
+| `indexPrevOut` int32 overflow (runtime crash) | Value 4294967295 (0xFFFFFFFF for coinbase) exceeds signed int32 max | Iceberg schema evolution: INT -> LONG for `indexPrevOut`, `nNonce`, `nBits`, `lockTime` |
 | HMS Hive 4.2.0 Thrift incompatible | PyIceberg uses Thrift client, Hive 4.2.0 changed Thrift API | Downgrade to Hive 3.1.3 |
 | HMS `IOStatisticsSource` ClassNotFoundException | hadoop-aws-3.4.1 needs Hadoop 3.3+, Hive 3.1.3 has 3.1.0 | Use hadoop-aws-3.1.0 + aws-sdk-1.11.271 |

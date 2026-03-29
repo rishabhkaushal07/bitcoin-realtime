@@ -118,6 +118,40 @@ python main.py --rpc-url http://127.0.0.1:8332 \
 
 ---
 
+## Live Pipeline Status (2026-03-28)
+
+The normalizer is running in live ZMQ mode, connected to the fully-synced Bitcoin Core
+node (height 942,722+). Blocks are processed within ~600ms of the ZMQ notification.
+
+**First live blocks processed:**
+
+| Block Height | Transactions | Inputs | Outputs | Kafka Records | Processing Time |
+|-------------:|-----------:|---------:|---------:|-------------:|:--------------:|
+| 942,725 | 5,684 | 7,240 | 13,075 | 26,000 | ~600ms |
+| 942,726 | 7,385 | 7,653 | 15,057 | 30,096 | ~680ms |
+| 942,727 | 5,383 | 7,077 | 12,575 | 25,036 | ~580ms |
+
+### Running as Background Service
+
+```bash
+# Start in background with logging
+nohup .venv/bin/python live-normalizer/main.py \
+    --rpc-url http://127.0.0.1:8332 \
+    --rpc-user bitcoinrpc \
+    --rpc-password changeme_strong_password_here \
+    --kafka-bootstrap localhost:9092 \
+    --zmq-url tcp://127.0.0.1:28332 \
+    > logs/normalizer.log 2>&1 &
+
+# Monitor
+tail -f logs/normalizer.log
+
+# Check checkpoint state
+cat checkpoint.json
+```
+
+---
+
 ## Design Decisions
 
 | Decision | Rationale |

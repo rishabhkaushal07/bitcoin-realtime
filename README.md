@@ -11,6 +11,7 @@ A real-time Bitcoin blockchain analytics platform that ingests blocks within sec
 ```
 
 **Started:** 2026-03-26
+**Live since:** 2026-03-28 (Phase 1 pipeline running, ingesting blocks in real time)
 **Reference repo:** `/local-scratch4/bitcoin_2025/dmg-bitcoin/` (batch-only predecessor)
 **Architecture plan:** [nifty-sauteeing-spring-evaluation-report-v3.md](../nifty-sauteeing-spring-evaluation-report-v3.md)
 **Implementation plan:** [plan.md](plan.md)
@@ -95,14 +96,38 @@ bash scripts/create-kafka-topics.sh
 # 4. Create Iceberg tables (requires HMS healthy)
 python scripts/create_iceberg_tables.py
 
-# 5. Test normalizer (no Kafka needed)
+# 5. Create StarRocks catalog + flat table
+mysql -h 127.0.0.1 -P 9030 -u root < starrocks/iceberg_catalog_v3.sql
+mysql -h 127.0.0.1 -P 9030 -u root < starrocks/flat_serving_v3.sql
+
+# 6. Test normalizer (no Kafka needed)
 python live-normalizer/main.py --test-block 0
 
-# 6. Run unit tests (133 tests, no external deps)
+# 7. Run unit tests (133 tests, no external deps)
 pytest tests/unit/
 
-# 7. Run integration tests (requires Docker services)
+# 8. Run integration tests (requires Docker services)
 pytest tests/integration/ -m integration
+```
+
+### Running the Live Pipeline
+
+```bash
+# Start the live normalizer (Bitcoin Core -> Kafka)
+nohup .venv/bin/python live-normalizer/main.py \
+    --rpc-url http://127.0.0.1:8332 \
+    --rpc-user bitcoinrpc \
+    --rpc-password changeme_strong_password_here \
+    --kafka-bootstrap localhost:9092 \
+    --zmq-url tcp://127.0.0.1:28332 \
+    > logs/normalizer.log 2>&1 &
+
+# Start the Iceberg writer (Kafka -> Iceberg)
+nohup .venv/bin/python pyiceberg-sidecar/iceberg_writer.py \
+    > logs/iceberg_writer.log 2>&1 &
+
+# Build flat serving table for new blocks (after Iceberg data lands)
+python starrocks/flat_table_builder.py --incremental
 ```
 
 ---
@@ -141,6 +166,7 @@ bitcoin-realtime/
 |   +-- iceberg_catalog_v3.sql    # External catalog -> HMS -> MinIO
 |   +-- flat_serving_v3.sql       # Native flat table DDL
 |   +-- flat_table_builder.py     # Incremental flat table builder
+|   +-- be.conf                   # Custom BE config (40GB mem, spill-to-disk)
 |   +-- README.md
 |
 +-- hive-metastore/               # HMS JAR dependencies
@@ -199,10 +225,11 @@ bitcoin-realtime/
 
 | Data Store | Path | Expected Size |
 |-----------|------|---------------|
-| Bitcoin Core | `bitcoin-core-data/` | ~600 GB |
+| Bitcoin Core | `bitcoin-core-data/` | ~831 GB (fully synced) |
 | MinIO (Iceberg) | `minio-data/` | ~1 TB |
 | StarRocks BE | `starrocks-data/` | ~200+ GB |
 | StarRocks FE | `starrocks-fe-meta/` | minimal |
+| StarRocks Spill | `starrocks-spill/` | variable (overflow from RAM) |
 | Kafka | `kafka-data/` | ~50 GB |
 | HMS MySQL | `hms-mysql-data/` | minimal |
 
@@ -296,11 +323,70 @@ mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep Alive
 | 1a | Event Backbone (normalizer + Kafka) | COMPLETE |
 | 1b | Raw Lake (PyIceberg writer -> Iceberg on MinIO) | COMPLETE |
 | 1c | Serving Bridge (StarRocks external + flat table) | COMPLETE |
+| 1 | **Phase 1 Live Pipeline** | **RUNNING (since 2026-03-28)** |
 | 2 | Historical Backfill + Cutover | NOT STARTED |
 | 3 | Operational Hardening | NOT STARTED |
 | 4 | Optional Scale-Out | NOT STARTED |
 
 See [plan.md](plan.md) for detailed task breakdowns per phase.
+
+---
+
+## Live Pipeline Status (2026-03-28)
+
+The Phase 1 pipeline is fully operational and ingesting live Bitcoin blocks:
+
+```
+Bitcoin Core (942,727)
+    |
+    | ZMQ hashblock notification
+    v
+Live Normalizer (PID running)      ~600ms per block
+    |
+    | 4 Kafka topics
+    v
+Iceberg Writer (PID running)        ~500ms per flush (100 records)
+    |
+    | Parquet on MinIO
+    v
+StarRocks (external catalog)        ~25ms warm-cache query
+    |
+    | Incremental flat table build
+    v
+bitcoin_flat_v3                     5,684 txs for block 942,725 in 1.4s
+```
+
+**First live blocks captured (2026-03-28):**
+
+| Block | Height | Transactions | Inputs | Outputs | Kafka Records |
+|-------|-------:|------------:|---------:|---------:|-------------:|
+| `00...3e4a` | 942,725 | 5,684 | 7,240 | 13,075 | 26,000 |
+| `00...251c` | 942,726 | 7,385 | 7,653 | 15,057 | 30,096 |
+| `00...2369` | 942,727 | 5,383 | 7,077 | 12,575 | 25,036 |
+
+### Monitoring the Live Pipeline
+
+```bash
+# Check normalizer (should show new blocks as they arrive ~every 10 min)
+tail -f logs/normalizer.log
+
+# Check iceberg-writer (should show flushes to Iceberg)
+tail -f logs/iceberg_writer.log
+
+# Check Kafka consumer lag
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:29092 --describe --group iceberg-writer
+
+# Query live data via StarRocks
+mysql -h 127.0.0.1 -P 9030 -u root -e "
+SET CATALOG iceberg_catalog;
+REFRESH EXTERNAL TABLE btc.blocks;
+SELECT height, block_hash, finality_status FROM btc.blocks ORDER BY height DESC LIMIT 5;
+"
+
+# Build flat table for new blocks
+python starrocks/flat_table_builder.py --incremental
+```
 
 ---
 
@@ -310,8 +396,8 @@ Measured end-to-end with historical blocks via RPC during Bitcoin Core IBD.
 Full report: [docs/latency-benchmark-baseline.md](docs/latency-benchmark-baseline.md)
 
 ```
-  Block → RPC(426ms) → Normalize(14ms) → Kafka(77ms) → Iceberg(392ms) → StarRocks(25ms)
-          ─────────────────── 909ms total (RPC → Iceberg) ───────────────────
+  Block -> RPC(426ms) -> Normalize(14ms) -> Kafka(77ms) -> Iceberg(392ms) -> StarRocks(25ms)
+           -------------------- 909ms total (RPC -> Iceberg) --------------------
 ```
 
 | Stage | Small (1 tx) | Medium (~100 tx) | Large (~2,500 tx) | Bottleneck? |
@@ -324,7 +410,18 @@ Full report: [docs/latency-benchmark-baseline.md](docs/latency-benchmark-baselin
 | **e2e per block** | **787 ms** | **580 ms** | **909 ms** | |
 | **Throughput** | 5 rec/s | 1,411 rec/s | **14,768 rec/s** | |
 
-Bitcoin produces ~1 block / 10 minutes → pipeline has **~660x headroom**.
+Bitcoin produces ~1 block / 10 minutes -> pipeline has **~660x headroom**.
+
+### Live Pipeline Performance (2026-03-28)
+
+With the pipeline running against the fully-synced Bitcoin Core node at block 942,725+:
+
+| Metric | Value | Notes |
+|--------|------:|-------|
+| Normalizer processing | ~600 ms/block | 5,000-7,000 tx blocks at current tip |
+| Kafka records per block | 25,000-30,000 | block + tx + inputs + outputs |
+| Flat table build (per block) | ~1.4 s | JOIN + ARRAY_AGG across 4 Iceberg tables |
+| StarRocks warm query | ~25 ms | Cached on BE SSD |
 
 ---
 
@@ -357,6 +454,8 @@ pytest tests/unit/ --cov=live-normalizer --cov-report=term-missing
 |-------|-------|
 | Binary | `bitcoind` v22.0.0 |
 | Data dir | `/local-scratch4/bitcoin_2025/bitcoin-core-data/` |
+| Data size | ~831 GB (blocks: 755G, chainstate: 11G, indexes: 62G) |
+| Sync status | **Fully synced** (height 942,722+, `initialblockdownload: false`) |
 | RPC port | 8332 |
 | ZMQ hashblock | tcp://0.0.0.0:28332 |
 | ZMQ rawblock | tcp://0.0.0.0:28333 |
@@ -371,13 +470,60 @@ bitcoin-cli -datadir=/local-scratch4/bitcoin_2025/bitcoin-core-data \
 
 ---
 
+## StarRocks BE Tuning
+
+The StarRocks BE is configured for a shared machine (62GB RAM, multiple services running).
+Custom `be.conf` is mounted into the container from `starrocks/be.conf`.
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `mem_limit` | `40G` | Fixed 40GB (not 90% default). Leaves room for Bitcoin Core (~12GB), Kafka, MinIO, HMS, Python pipelines on this 62GB machine |
+| `spill_local_storage_dir` | `/opt/starrocks/be/spill` | Bound to `/local-scratch4/bitcoin_2025/starrocks-spill/` (SSD). Spill intermediate results to disk instead of OOM on large JOINs |
+| `enable_spill` (global) | `true` | Allows queries to spill to disk when exceeding memory |
+| `spill_mode` (global) | `auto` | Spill triggered automatically by memory pressure |
+| `query_timeout` (global) | `3600` | 1 hour timeout for long Iceberg queries |
+| `insert_timeout` (global) | `7200` | 2 hour timeout for flat table batch inserts |
+
+The spill directory, custom BE config, and storage are all bind-mounted to SSD:
+
+```yaml
+# docker-compose.yml starrocks-be volumes:
+- /local-scratch4/bitcoin_2025/starrocks-data:/opt/starrocks/be/storage
+- /local-scratch4/bitcoin_2025/starrocks-spill:/opt/starrocks/be/spill
+- ./starrocks/be.conf:/opt/starrocks/be/conf/be.conf:ro
+```
+
+See `starrocks/README.md` for full details and the `dmg-bitcoin/starrocks/README.md`
+for historical reference on memory management, spill configuration, and tuning notes.
+
+---
+
+## Schema Evolution (2026-03-28)
+
+Several unsigned 32-bit Bitcoin fields were stored as signed INT (max 2,147,483,647),
+which overflows for values like coinbase `indexPrevOut = 4,294,967,295` (0xFFFFFFFF)
+and `nNonce` values above 2^31. Fixed via Iceberg schema evolution (INT -> LONG):
+
+| Table | Column | Old Type | New Type | Overflow Example |
+|-------|--------|----------|----------|-----------------|
+| `btc.blocks` | `nNonce` | INT | **LONG** | Nonce values > 2^31 |
+| `btc.blocks` | `nBits` | INT | **LONG** | Compact target values |
+| `btc.tx_in` | `indexPrevOut` | INT | **LONG** | Coinbase sentinel 0xFFFFFFFF |
+| `btc.transactions` | `lockTime` | INT | **LONG** | Future-proof for unsigned 32-bit |
+
+These changes were applied as live Iceberg schema evolutions (no table recreation needed)
+and updated in all DDL files (`create_iceberg_tables.py`, `create_raw_tables.sql`,
+`create_iceberg_tables_spark.py`) and integration tests.
+
+---
+
 ## Machine Specs
 
 | Resource | Value |
 |----------|-------|
 | CPU | 16 cores |
 | RAM | 62 GB |
-| Disk (local-scratch4) | 3.6 TB total, ~2.6 TB free |
+| Disk (local-scratch4) | 3.6 TB total, ~1.8 TB free (50% used) |
 | OS | Linux 6.2.0-26-generic |
 | Docker | 26.0.0 |
 | Python | 3.10.12 |

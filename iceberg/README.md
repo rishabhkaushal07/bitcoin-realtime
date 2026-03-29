@@ -42,9 +42,10 @@ Apache Iceberg table definitions for the raw source-of-truth layer, stored on Mi
 
 ---
 
-## Status: COMPLETE (Phase 1b)
+## Status: COMPLETE and LIVE (Phase 1b)
 
 Tables are created via PyIceberg (not Spark SQL), using `scripts/create_iceberg_tables.py`.
+Live data is being written since 2026-03-28 by the PyIceberg sidecar.
 
 ---
 
@@ -66,7 +67,7 @@ Tables are created via PyIceberg (not Spark SQL), using `scripts/create_iceberg_
 | **Format v2** | Required for row-level deletes: reorg handling needs to soft-delete or overwrite individual rows when a block is orphaned |
 | **Identifier fields** | Enable upsert semantics via PyIceberg. When the finality updater promotes OBSERVED to CONFIRMED, it overwrites the row matched by identifier fields (e.g., `block_hash` for blocks) instead of appending a duplicate |
 | **Hidden partitioning** | `bucket(10, height)` is transparent to queries. Writers don't need to know the partition scheme; readers get automatic partition pruning on height-range predicates |
-| **Schema evolution** | Columns can be added later (e.g., `fee`, `weight`) without rewriting existing data files |
+| **Schema evolution** | Columns can be added/widened later without rewriting existing data files. Used to evolve INT->LONG for unsigned 32-bit Bitcoin fields (nNonce, nBits, indexPrevOut, lockTime) |
 | **Time travel** | Snapshot-based versioning lets us debug issues by querying table state at any prior commit |
 | **Open format** | Same Iceberg tables readable by PyIceberg, Spark, StarRocks, and any future engine |
 
@@ -132,6 +133,20 @@ rows, and how reorg handling sets `finality_status = REORGED` on orphaned blocks
 The append writer (new block data) does NOT use identifier fields — it uses plain
 append mode for maximum throughput. Identifier-based upserts are only used by the
 finality/reorg path.
+
+---
+
+## Schema Evolution History
+
+| Date | Table | Column | Change | Reason |
+|------|-------|--------|--------|--------|
+| 2026-03-28 | `btc.blocks` | `nNonce` | INT -> LONG | Unsigned 32-bit nonce values (up to 4.3B) overflow signed INT32 |
+| 2026-03-28 | `btc.blocks` | `nBits` | INT -> LONG | Compact target hex-to-int can exceed signed INT32 max |
+| 2026-03-28 | `btc.tx_in` | `indexPrevOut` | INT -> LONG | Coinbase sentinel value 0xFFFFFFFF (4,294,967,295) overflows INT32 |
+| 2026-03-28 | `btc.transactions` | `lockTime` | INT -> LONG | Bitcoin lockTime is unsigned 32-bit |
+
+Applied via PyIceberg `table.update_schema()` — no table recreation needed.
+Existing Parquet files with INT values are automatically promoted to LONG on read.
 
 ---
 

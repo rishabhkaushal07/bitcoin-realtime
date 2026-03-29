@@ -113,7 +113,7 @@ class TestStarRocksDDLConsistency:
 
     def test_flat_table_has_txid_primary_key(self):
         ddl = _read_file("starrocks/flat_serving_v3.sql")
-        assert "PRIMARY KEY (txid)" in ddl
+        assert "PRIMARY KEY (txid, block_height)" in ddl
 
     def test_flat_table_partitioned_by_height(self):
         ddl = _read_file("starrocks/flat_serving_v3.sql")

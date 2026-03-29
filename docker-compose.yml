@@ -183,6 +183,8 @@ services:
       - STARROCKS_FE_HOST=starrocks-fe
     volumes:
       - /local-scratch4/bitcoin_2025/starrocks-data:/opt/starrocks/be/storage
+      - /local-scratch4/bitcoin_2025/starrocks-spill:/opt/starrocks/be/spill
+      - ./starrocks/be.conf:/opt/starrocks/be/conf/be.conf:ro
     depends_on:
       starrocks-fe:
         condition: service_healthy

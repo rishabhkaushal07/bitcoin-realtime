@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS btc.blocks (
     hashPrev        STRING      COMMENT 'Previous block hash',
     hashMerkleRoot  STRING      COMMENT 'Merkle root hash',
     nTime           INT         COMMENT 'Block timestamp (Unix epoch)',
-    nBits           INT         COMMENT 'Compact target (integer, not hex)',
-    nNonce          INT         COMMENT 'Nonce',
+    nBits           BIGINT      COMMENT 'Compact target (integer, not hex)',
+    nNonce          BIGINT      COMMENT 'Nonce',
     -- Live/derived metadata columns
     block_timestamp TIMESTAMP   COMMENT 'Block timestamp as datetime (from nTime)',
     observed_at     STRING      COMMENT 'UTC ISO timestamp when normalizer processed this block',
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS btc.transactions (
     txid            STRING      COMMENT 'Transaction ID (64-char hex)',
     hashBlock       STRING      COMMENT 'Parent block hash',
     version         INT         COMMENT 'Transaction version',
-    lockTime        INT         COMMENT 'Lock time',
+    lockTime        BIGINT      COMMENT 'Lock time',
     -- Live/derived metadata columns
     block_height    INT         COMMENT 'Parent block height',
     block_timestamp TIMESTAMP   COMMENT 'Parent block timestamp as datetime',
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS btc.tx_in (
     -- Historical core columns
     txid            STRING      COMMENT 'Parent transaction ID',
     hashPrevOut     STRING      COMMENT 'Previous output tx hash (64 zeros for coinbase)',
-    indexPrevOut    INT         COMMENT 'Previous output index (4294967295 for coinbase)',
+    indexPrevOut    BIGINT      COMMENT 'Previous output index (4294967295 for coinbase)',
     scriptSig       STRING      COMMENT 'Input script (hex)',
     sequence        BIGINT      COMMENT 'Sequence number',
     -- Live/derived metadata columns

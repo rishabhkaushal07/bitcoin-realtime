@@ -12,13 +12,14 @@ USE bitcoin_v3;
 -- One row per transaction with ARRAY<STRUCT> for inputs and outputs.
 -- Matches the design from the original dmg-bitcoin flat_table_v1.
 CREATE TABLE IF NOT EXISTS bitcoin_flat_v3 (
+    -- Primary key columns first (txid + block_height for partitioning)
+    txid                VARCHAR(64),
+    block_height        INT,
     -- Block fields
     block_hash          VARCHAR(64),
-    block_height        INT,
     block_timestamp     DATETIME,
     nTime               INT,
     -- Transaction fields
-    txid                VARCHAR(64),
     tx_version          INT,
     lockTime            INT,
     -- Aggregated inputs
@@ -42,7 +43,7 @@ CREATE TABLE IF NOT EXISTS bitcoin_flat_v3 (
     finality_status     VARCHAR(16)
 )
 ENGINE = OLAP
-PRIMARY KEY (txid)
+PRIMARY KEY (txid, block_height)
 PARTITION BY RANGE (block_height) (
     -- Partitions in chunks of 100,000 blocks
     -- Add new partitions as chain grows
@@ -73,11 +74,11 @@ PROPERTIES (
 
 -- INSERT INTO bitcoin_v3.bitcoin_flat_v3
 -- SELECT
---     b.block_hash,
+--     t.txid,
 --     b.height AS block_height,
+--     b.block_hash,
 --     b.block_timestamp,
 --     b.nTime,
---     t.txid,
 --     t.version AS tx_version,
 --     t.lockTime,
 --     -- Inputs

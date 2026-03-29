@@ -40,11 +40,11 @@ STARROCKS_PASSWORD = ""
 INSERT_BLOCK_SQL = """
 INSERT INTO bitcoin_v3.bitcoin_flat_v3
 SELECT
-    b.block_hash,
+    t.txid,
     b.height AS block_height,
+    b.block_hash,
     b.block_timestamp,
     b.nTime,
-    t.txid,
     t.version AS tx_version,
     t.lockTime,
     -- Inputs

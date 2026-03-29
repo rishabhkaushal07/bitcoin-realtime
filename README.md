@@ -1,18 +1,30 @@
-# Bitcoin Real-Time Ingestion Pipeline
+# Realtime Bitcoin Ingestion & Analytics
 
 A real-time Bitcoin blockchain analytics platform that ingests blocks within seconds of being mined, lands them in an Iceberg lakehouse on MinIO, and serves denormalized flat tables from StarRocks.
 
 ```
- ____  _ _            _         ____            _       _____ _
-| __ )(_) |_ ___ ___ (_)_ __   |  _ \ ___  __ _| |     |_   _(_)_ __ ___   ___
-|  _ \| | __/ __/ _ \| | '_ \  | |_) / _ \/ _` | |_____  | | | | '_ ` _ \ / _ \
-| |_) | | || (_| (_) | | | | | |  _ <  __/ (_| | |_____| | | | | | | | | |  __/
-|____/|_|\__\___\___/|_|_| |_| |_| \_\___|\__,_|_|       |_| |_|_| |_| |_|\___|
+ ____            _ _   _                  ____  _ _            _
+|  _ \ ___  __ _| | |_(_)_ __ ___   ___ | __ )(_) |_ ___ ___ (_)_ __
+| |_) / _ \/ _` | | __| | '_ ` _ \ / _ \|  _ \| | __/ __/ _ \| | '_ \
+|  _ <  __/ (_| | | |_| | | | | | |  __/| |_) | | || (_| (_) | | | | |
+|_| \_\___|\__,_|_|\__|_|_| |_| |_|\___||____/|_|\__\___\___/|_|_| |_|
+ ___                       _   _                ___
+|_ _|_ __   __ _  ___  __| |_(_) ___  _ __    ( _ )
+ | || '_ \ / _` |/ _ \/ __| __| |/ _ \| '_ \  / _ \
+ | || | | | (_| |  __/\__ \ |_| | (_) | | | || (_) |
+|___|_| |_|\__, |\___||___/\__|_|\___/|_| |_| \___/
+           |___/
+    _                _       _   _
+   / \   _ __   __ _| |_   _| |_(_) ___ ___
+  / _ \ | '_ \ / _` | | | | | __| |/ __/ __|
+ / ___ \| | | | (_| | | |_| | |_| | (__\__ \
+/_/   \_\_| |_|\__,_|_|\__, |\__|_|\___|___/
+                        |___/
 ```
 
 **Started:** 2026-03-26
 **Live since:** 2026-03-28 (Phase 1 pipeline running, ingesting blocks in real time)
-**Reference repo:** `/local-scratch4/bitcoin_2025/dmg-bitcoin/` (batch-only predecessor)
+**Reference repo:** `/local-scratch4/bitcoin_2025/legacy-batch-pipeline/` (batch-only predecessor)
 **Architecture plan:** [nifty-sauteeing-spring-evaluation-report-v3.md](../nifty-sauteeing-spring-evaluation-report-v3.md)
 **Implementation plan:** [plan.md](plan.md)
 
@@ -75,6 +87,103 @@ A real-time Bitcoin blockchain analytics platform that ingests blocks within sec
 PyIceberg-based writer because the runtime ZIP is not available as a pre-built
 download. PyIceberg provides native upsert with identifier fields for idempotent
 writes and was the "valid fallback" path from the V3 architecture document.
+
+### Architecture (Mermaid)
+
+```mermaid
+flowchart TD
+    subgraph Source["Bitcoin Network"]
+        BC["Bitcoin Core<br/>Full Node"]
+    end
+
+    subgraph RealTime["Path A: Real-Time Ingestion (~1s end-to-end)"]
+        ZMQ["ZMQ hashblock<br/>push notification"]
+        LN["Live Normalizer<br/>(Python, ~600ms/block)"]
+        KF["Kafka (KRaft)<br/>4 data topics + 1 control"]
+        IW["PyIceberg Writer<br/>(batched Kafka consumer)"]
+    end
+
+    subgraph Historical["Path B: Historical Bulk Load (one-time)"]
+        DAT["blk*.dat files<br/>(755 GB raw blocks)"]
+        RBP["rusty-blockparser<br/>(Rust CSV dump)"]
+        CSV["4 CSV files<br/>(~1.2 TB)"]
+        SPK["PySpark 4.1.1<br/>(bulk Iceberg writer)"]
+    end
+
+    subgraph Lake["Iceberg Lakehouse on MinIO"]
+        ICE["btc.blocks | btc.transactions<br/>btc.tx_in | btc.tx_out<br/>(Parquet, bucket-partitioned)"]
+    end
+
+    subgraph Serving["StarRocks 4.0.8"]
+        EXT["iceberg_catalog<br/>(external, reads MinIO)"]
+        FLAT["bitcoin_flat_v3<br/>(native flat table, local SSD)"]
+    end
+
+    BC -->|"ZMQ push"| ZMQ --> LN
+    LN -->|"RPC getblock"| BC
+    LN --> KF --> IW
+    IW -->|"append Parquet"| ICE
+
+    DAT --> RBP --> CSV --> SPK
+    SPK -->|"write Parquet"| ICE
+
+    ICE -->|"read on query"| EXT
+    EXT -->|"JOIN + INSERT INTO"| FLAT
+
+    style Lake fill:#e1f5fe
+    style Serving fill:#fff3e0
+    style RealTime fill:#e8f5e9
+    style Historical fill:#fce4ec
+```
+
+---
+
+## Dual-Path Data Convergence
+
+Both the real-time pipeline and the historical bulk load write to the **same Iceberg
+tables** on MinIO. Iceberg merges them seamlessly — they are just additional Parquet
+data files registered in the same table metadata.
+
+```
+ TIME ──────────────────────────────────────────────────────────>
+
+ HISTORICAL (Path B)                 REAL-TIME (Path A)
+ ~~~~~~~~~~~~~~~~~~~~               ~~~~~~~~~~~~~~~~~~
+
+ Block 0 ─────────── Block 942,724  Block 942,725 ───── Block N
+ |                              |   |                        |
+ | rusty-blockparser            |   | Live Normalizer        |
+ |   (blk*.dat -> CSV)         |   |   (ZMQ + RPC)          |
+ |                              |   |                        |
+ | PySpark                      |   | Kafka                  |
+ |   (CSV -> Iceberg Parquet)  |   |   (4 topics)           |
+ |                              |   |                        |
+ +──────────────────────────────+   | PyIceberg Writer       |
+                |                   |   (append Parquet)     |
+                |                   |                        |
+                v                   v                        |
+         +============================================+      |
+         |        Iceberg on MinIO                    |      |
+         |        (unified Parquet files)             |<─────+
+         |                                            |
+         |  Both paths produce identical schemas:     |
+         |  blocks, transactions, tx_in, tx_out       |
+         +============================================+
+                          |
+                          v
+                  StarRocks queries
+                  all data uniformly
+```
+
+| Aspect | Path A: Real-Time | Path B: Historical Bulk |
+|--------|-------------------|------------------------|
+| **Source** | ZMQ + RPC (live Bitcoin Core) | blk*.dat files on disk |
+| **Parser** | Python (live-normalizer) | Rust (rusty-blockparser) |
+| **Transport** | Kafka -> PyIceberg | PySpark direct write |
+| **Volume** | ~6,000 tx/block, every ~10 min | ~1B transactions, one-time |
+| **Speed** | ~1s per block | Hours for full history |
+| **When** | Continuously, from block 942,725+ | One-time backfill (Phase 2) |
+| **Status** | Running since 2026-03-28 | Not started |
 
 ---
 
@@ -233,6 +342,208 @@ bitcoin-realtime/
 | Kafka | `kafka-data/` | ~50 GB |
 | HMS MySQL | `hms-mysql-data/` | minimal |
 
+### Expected Sizes After Full Backfill (Phase 2)
+
+```
+ CURRENT STATE (real-time only)        AFTER HISTORICAL BACKFILL
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~        ~~~~~~~~~~~~~~~~~~~~~~~~
+
+ MinIO:      9.6 GB                    MinIO:      ~800 GB - 1 TB
+ StarRocks:  1.1 GB (flat table)       StarRocks:  ~200+ GB (full flat table)
+ Kafka:      4 KB  (drained)           Kafka:      ~4 KB (same, transient)
+ Total:      ~11 GB                    Total:      ~1.0 - 1.2 TB
+```
+
+---
+
+## Data Model
+
+All four Iceberg tables share a common schema across both ingestion paths
+(real-time and historical). Partitioned by `bucket(10, height)` for even
+distribution and partition pruning.
+
+```
+ +------------------+       +-------------------+
+ |   btc.blocks     |       |  btc.transactions |
+ +------------------+       +-------------------+
+ | block_hash    PK |<──┐   | txid           PK |
+ | height           |   |   | block_hash     FK |──> blocks
+ | version          |   |   | block_height      |
+ | blocksize        |   |   | version           |
+ | hashPrev         |   |   | lockTime     LONG |
+ | hashMerkleRoot   |   |   | tx_index          |
+ | nTime            |   |   | input_count       |
+ | nBits       LONG |   |   | output_count      |
+ | nNonce      LONG |   |   | is_coinbase       |
+ | block_timestamp  |   |   | observed_at       |
+ | observed_at      |   |   | ingested_at       |
+ | ingested_at      |   |   | finality_status   |
+ | finality_status  |   |   +-------------------+
+ | source_seq       |   |           |
+ +------------------+   |     +-----+------+
+                        |     |            |
+                        |     v            v
+                        | +------------+ +-------------+
+                        | | btc.tx_in  | | btc.tx_out  |
+                        | +------------+ +-------------+
+                        | | txid    FK | | txid     FK |
+                        | | tx_idx     | | tx_idx      |
+                        | | hashPrev.. | | indexOut     |
+                        | | indexPrev  | | value       |
+                        | |   Out LONG | | scriptPub.. |
+                        | | scriptSig  | | address     |
+                        | | sequence   | | observed_at |
+                        | | observed_at| | ingested_at |
+                        | | ingested_at| | finality_.. |
+                        | | finality.. | +-------------+
+                        | +------------+
+                        |
+                        +── Partitioned by bucket(10, height)
+                            across all 4 tables
+```
+
+```mermaid
+erDiagram
+    blocks ||--o{ transactions : "block_hash"
+    transactions ||--o{ tx_in : "txid"
+    transactions ||--o{ tx_out : "txid"
+
+    blocks {
+        string block_hash PK
+        int height
+        int version
+        int blocksize
+        long nBits
+        long nNonce
+        datetime block_timestamp
+        string finality_status
+    }
+
+    transactions {
+        string txid PK
+        string block_hash FK
+        int block_height
+        long lockTime
+        int tx_index
+        boolean is_coinbase
+    }
+
+    tx_in {
+        string txid FK
+        int tx_idx
+        string hashPrevOut
+        long indexPrevOut
+        string scriptSig
+        long sequence
+    }
+
+    tx_out {
+        string txid FK
+        int tx_idx
+        int indexOut
+        long value
+        string scriptPubKey
+        string address
+    }
+```
+
+### Flat Serving Table (denormalized)
+
+The `bitcoin_flat_v3` table pre-joins all four Iceberg tables into a single
+denormalized row per transaction with nested JSON arrays for inputs and outputs.
+
+```
+ bitcoin_flat_v3  (StarRocks native table, local SSD)
+ +-------------------------------------------------------+
+ | txid              | block_hash        | block_height   |
+ | tx_index          | block_timestamp   | version        |
+ | lockTime          | is_coinbase       | input_count    |
+ | output_count      |                   |                |
+ |                   |                   |                |
+ | inputs  (JSON array of all tx_in for this tx)         |
+ | outputs (JSON array of all tx_out for this tx)        |
+ +-------------------------------------------------------+
+   PK: (txid, block_height)
+   Partitioned: 10 RANGE partitions on block_height
+   Built by: starrocks/flat_table_builder.py --incremental
+```
+
+---
+
+## StarRocks: External vs Native Tables
+
+StarRocks serves two roles — it reads raw Iceberg data from MinIO via an external
+catalog and stores a materialized flat table on local SSD for fast queries.
+
+```
+ WHERE DOES DATA ACTUALLY LIVE?
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                       StarRocks
+                       +-----------+
+                       | Flat Table|  ~1.1 GB currently
+                       | (native)  |  (materialized on local SSD)
+                       +-----------+
+                            ^
+                            | INSERT INTO ... SELECT
+                            | (JOINs 4 external Iceberg tables)
+                            |
+ +------------------+       |
+ |   MinIO (S3)     |-------+
+ |   9.6 GB now     |
+ |   ~1 TB after    |  <-- Iceberg Parquet files
+ |   backfill       |      (source of truth for ALL data)
+ +------------------+
+      ^           ^
+      |           |
+   PyIceberg   PySpark
+   Writer      Bulk Load
+   (real-time) (historical)
+```
+
+```mermaid
+graph LR
+    subgraph MinIO["MinIO (S3-compatible storage)"]
+        P1["blocks<br/>Parquet files"]
+        P2["transactions<br/>Parquet files"]
+        P3["tx_in<br/>Parquet files"]
+        P4["tx_out<br/>Parquet files"]
+    end
+
+    subgraph SR["StarRocks"]
+        subgraph External["iceberg_catalog (external)"]
+            E1["btc.blocks"]
+            E2["btc.transactions"]
+            E3["btc.tx_in"]
+            E4["btc.tx_out"]
+        end
+
+        subgraph Native["bitcoin_v3 (native)"]
+            F["bitcoin_flat_v3<br/>(denormalized, sub-second queries)"]
+        end
+    end
+
+    P1 -.->|"read on query<br/>(no data copy)"| E1
+    P2 -.->|"read on query"| E2
+    P3 -.->|"read on query"| E3
+    P4 -.->|"read on query"| E4
+
+    E1 & E2 & E3 & E4 -->|"JOIN + INSERT INTO"| F
+
+    style External fill:#e3f2fd
+    style Native fill:#fff8e1
+```
+
+| Table Type | Storage Location | Data Size | Query Speed | Auto-Updated? |
+|-----------|-----------------|-----------|-------------|---------------|
+| **External** (iceberg_catalog) | MinIO (Parquet) | ~9.6 GB (growing) | Moderate (reads S3) | Yes (always current) |
+| **Native** (bitcoin_v3) | StarRocks local SSD | ~1.1 GB | Sub-second | No (manual rebuild) |
+
+**Why is StarRocks only 1.1 GB?** Because the raw Iceberg tables (blocks, transactions,
+tx_in, tx_out) live entirely in MinIO as Parquet files. StarRocks queries them through
+its external Iceberg catalog without copying any data. Only the pre-joined flat table
+is stored on StarRocks' local SSD.
+
 ---
 
 ## Technology Choices and Rationale
@@ -317,6 +628,29 @@ mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep Alive
 
 ## Implementation Phases
 
+```
+ Phase 0: Prerequisites                              [████████████] COMPLETE
+   Bitcoin Core synced, Docker infra up
+
+ Phase 1: Real-Time Pipeline                          [████████████] RUNNING
+   1a: Event Backbone (normalizer + Kafka)            [████████████] COMPLETE
+   1b: Raw Lake (PyIceberg -> Iceberg on MinIO)       [████████████] COMPLETE
+   1c: Serving Bridge (StarRocks catalog + flat)      [████████████] COMPLETE
+
+ Phase 2: Historical Backfill + Cutover               [            ] NOT STARTED
+   PySpark: rusty-blockparser CSV -> Iceberg on MinIO
+   Load ~942K blocks, ~1B txs, ~2.5B inputs, ~2.7B outputs
+   Full flat table rebuild in StarRocks
+   Parity validation vs old StarRocks tables
+
+ Phase 3: Operational Hardening                       [            ] NOT STARTED
+   Monitoring, alerting, auto-recovery
+   Iceberg maintenance (compaction, snapshot expiry)
+
+ Phase 4: Optional Scale-Out                          [            ] NOT STARTED
+   Multi-BE StarRocks, Kafka partitioning
+```
+
 | Phase | Name | Status |
 |-------|------|--------|
 | 0 | Prerequisites | COMPLETE |
@@ -328,7 +662,78 @@ mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" | grep Alive
 | 3 | Operational Hardening | NOT STARTED |
 | 4 | Optional Scale-Out | NOT STARTED |
 
+```mermaid
+gantt
+    title Implementation Timeline
+    dateFormat YYYY-MM-DD
+    axisFormat %b %d
+
+    section Phase 0
+    Prerequisites           :done, p0, 2026-03-26, 2026-03-26
+
+    section Phase 1
+    1a Event Backbone       :done, p1a, 2026-03-26, 2026-03-27
+    1b Raw Lake             :done, p1b, 2026-03-27, 2026-03-28
+    1c Serving Bridge       :done, p1c, 2026-03-28, 2026-03-28
+    Live Pipeline Running   :active, p1live, 2026-03-28, 2026-03-30
+
+    section Phase 2
+    Historical Backfill     :p2, after p1live, 5d
+
+    section Phase 3
+    Operational Hardening   :p3, after p2, 3d
+```
+
 See [plan.md](plan.md) for detailed task breakdowns per phase.
+
+### Phase 2: Historical Backfill Flow
+
+```
+ HISTORICAL BACKFILL (Phase 2)
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ Step 1: Parse raw blocks (already done)
+ +----------+         +------------------+         +---------------+
+ | blk*.dat |-------->| rusty-blockparser|-------->| 4 CSV files   |
+ | (755 GB) |  Rust   | (csvdump)        |  ~1.2TB| blocks.csv    |
+ |          |  parse  |                  |        | tx.csv        |
+ +----------+         +------------------+        | tx_in.csv     |
+                                                   | tx_out.csv    |
+                                                   +-------+-------+
+                                                           |
+ Step 2: Bulk load into Iceberg (Phase 2 work)             |
+                                                           v
+                                               +-----------+-----------+
+                                               |  PySpark 4.1.1        |
+                                               |  - Read CSVs          |
+                                               |  - Map to Iceberg     |
+                                               |    table schemas      |
+                                               |  - Write as Parquet   |
+                                               |    to MinIO           |
+                                               +-----------+-----------+
+                                                           |
+                                                           v
+                                               +=======================+
+                                               | Iceberg on MinIO      |
+                                               | (same tables as       |
+                                               |  real-time pipeline)  |
+                                               |                       |
+                                               | btc.blocks     ~942K  |
+                                               | btc.transactions ~1B  |
+                                               | btc.tx_in      ~2.5B  |
+                                               | btc.tx_out     ~2.7B  |
+                                               +=======================+
+                                                           |
+ Step 3: Rebuild flat table                                v
+                                               +=======================+
+                                               | StarRocks             |
+                                               | INSERT INTO           |
+                                               |   bitcoin_flat_v3     |
+                                               | SELECT ... FROM       |
+                                               |   iceberg_catalog     |
+                                               |   JOIN all 4 tables   |
+                                               +=======================+
+```
 
 ---
 
@@ -493,7 +898,7 @@ The spill directory, custom BE config, and storage are all bind-mounted to SSD:
 - ./starrocks/be.conf:/opt/starrocks/be/conf/be.conf:ro
 ```
 
-See `starrocks/README.md` for full details and the `dmg-bitcoin/starrocks/README.md`
+See `starrocks/README.md` for full details and the legacy repo's `starrocks/README.md`
 for historical reference on memory management, spill configuration, and tuning notes.
 
 ---

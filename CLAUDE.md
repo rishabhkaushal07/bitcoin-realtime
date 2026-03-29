@@ -6,7 +6,7 @@ All project data and code lives under `/local-scratch4/bitcoin_2025/` (SSD).
 
 ### Code and Docs
 - **Active repo:** `/local-scratch4/bitcoin_2025/bitcoin-realtime/` — all new code, configs, and docs go here.
-- **Old repo (read-only):** `/local-scratch4/bitcoin_2025/dmg-bitcoin/` — reference only. Do NOT modify. May read for schema/code reference.
+- **Old repo (read-only):** `/local-scratch4/bitcoin_2025/legacy-batch-pipeline/` — reference only. Do NOT modify. May read for schema/code reference.
 
 ### Persistent Data (all on `/local-scratch4/bitcoin_2025/`)
 - **Bitcoin Core:** `bitcoin-core-data/` (~600 GB) — full node with txindex, RPC, ZMQ

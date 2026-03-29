@@ -10,7 +10,7 @@ USE bitcoin_v3;
 
 -- ----- Flat serving table -----
 -- One row per transaction with ARRAY<STRUCT> for inputs and outputs.
--- Matches the design from the original dmg-bitcoin flat_table_v1.
+-- Matches the design from the original legacy batch pipeline flat_table_v1.
 CREATE TABLE IF NOT EXISTS bitcoin_flat_v3 (
     -- Primary key columns first (txid + block_height for partitioning)
     txid                VARCHAR(64),

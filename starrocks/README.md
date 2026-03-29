@@ -212,7 +212,7 @@ mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW VARIABLES LIKE '%spill%'"
 
 For detailed notes on StarRocks memory management, spill-to-disk debugging, query
 profiling, and heap analysis, see the old repo documentation at
-`dmg-bitcoin/starrocks/README.md`. That repo ran StarRocks 3.1.3 (all-in-one) on
+the legacy batch pipeline's `starrocks/README.md`. That repo ran StarRocks 3.1.3 (all-in-one) on
 much larger machines (256GB-1.5TB RAM) and contains extensive notes on tuning for
 full-chain analytics workloads.
 
